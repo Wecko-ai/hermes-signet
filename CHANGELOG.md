@@ -10,8 +10,8 @@ First release.
 - Held emails for everything that could not be sealed (YOLO, approvals off, timeouts, scheduled
   runs, denials), with `/signet show`, `/signet send`, `/signet drop`. `/signet send` shows an
   email in full before it seals it.
-- Guard on direct mailers in `terminal` and `execute_code` calls: commands are split the way a
-  shell splits them, scripts are judged by what they import and call.
+- Guard on direct mailers in `terminal`, `execute_code` and `process_manage` calls: commands are
+  split the way a shell splits them, scripts are judged by what they import and call.
 - Deterministic notes on the card: look-alike domains, new recipients, secrets, odd links,
   invisible characters, text that Hermes masks.
 - Transports: `outbox`, `command`, `smtp`.

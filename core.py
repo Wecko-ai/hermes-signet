@@ -313,7 +313,11 @@ def _read_attachment(raw: str, base_dir: Optional[Path]) -> Attachment:
         raise DraftError(f"attachment is not a regular file: {raw}")
     if is_credential_path(str(resolved)) or is_credential_path(str(path)):
         raise DraftError(f"attachment refused: “{resolved.name}” looks like a credential file")
-    name, _ = _clean_line(resolved.name, "attachment name", 255)
+    # The path and the name are printed on the card: they must be plain, visible text on one line.
+    shown, _ = _clean_line(str(resolved), "attachment path", 4096)
+    if shown != str(resolved):
+        raise DraftError("attachment refused: its path contains invisible or control characters")
+    name = resolved.name
     hasher = hashlib.sha256()
     size = 0
     carried = b""  # the end of the previous chunk, so a marker cut in two is still found

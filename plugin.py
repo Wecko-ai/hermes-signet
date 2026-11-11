@@ -54,6 +54,10 @@ _GUARD_BLOCK = (
     "Send it with the signet_send_mail tool instead: the user sees the exact message and approves it. "
     "Do not retry this command and do not look for another way to send."
 )
+_GUARD_TOO_LARGE = (
+    "BLOCKED by Signet: this command names a mailer and is too large to inspect. Split it into smaller "
+    "commands. To send email, use the signet_send_mail tool: the user sees the exact message and approves it."
+)
 _GUARD_APPROVE = (
     "This command sends email with {label}, outside Signet: you will not see the message on a card "
     "and nothing checks what leaves. Allow it only if you know exactly what it sends."
@@ -228,6 +232,8 @@ class Signet:
             self.outbox().record("blocked", mailer=label, tool=tool_name, scheduled=cron or None)
         except Exception:  # noqa: BLE001 - the ledger is a record, the block does not depend on it
             logger.exception("signet: could not record a blocked send")
+        if label == guard.TOO_LARGE:
+            return {"action": "block", "message": _GUARD_TOO_LARGE}
         return {"action": "block", "message": _GUARD_BLOCK.format(label=label)}
 
     def pre_approval_request(self, pattern_key: str = "", **kwargs: Any) -> None:

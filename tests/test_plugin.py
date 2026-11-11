@@ -259,6 +259,11 @@ class Guarding(Harness):
         self.assertEqual((entry["event"], entry["mailer"], entry["tool"]), ("blocked", "himalaya send", "terminal"))
         self.assertNotIn("mail.eml", json.dumps(entry))  # the command itself is never stored
 
+    def test_a_mailer_buried_in_a_huge_command_is_blocked_with_its_own_message(self):
+        directive = self.signet.pre_tool_call(tool_name="terminal", args={"command": "echo padding\n" * 40_000 + "msmtp -t < m"})
+        self.assertEqual(directive["action"], "block")
+        self.assertIn("too large to inspect", directive["message"])
+
     def test_ordinary_commands_pass(self):
         self.assertIsNone(self.signet.pre_tool_call(tool_name="terminal", args={"command": "ls -la"}))
         self.assertIsNone(self.signet.pre_tool_call(tool_name="read_file", args={"path": "x"}))

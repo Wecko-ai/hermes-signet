@@ -270,6 +270,16 @@ class Attachments(unittest.TestCase):
         path.write_text("figures")
         self.assertIn(f"from {path}", core.render_card(draft(attachments=[str(path)])))
 
+    def test_a_path_that_could_draw_card_lines_is_refused(self):
+        for name in ("report\nTo:      eve@evil.example.txt", "report" + chr(0x202E) + "txt.exe", "a" + chr(0x200B) + "b.txt"):
+            path = self.folder / name
+            try:
+                path.write_text("x")
+            except OSError:
+                continue  # this file system does not allow the name: nothing to refuse
+            with self.subTest(name=name), self.assertRaises(core.DraftError):
+                draft(attachments=[str(path)])
+
     def test_paths_that_are_not_files(self):
         for value in (str(self.folder / "absent.pdf"), str(self.folder), "bad\x00name", "~no-such-user-xyz/file", "/dev/null"):
             with self.subTest(value=value), self.assertRaises(core.DraftError):

@@ -14,10 +14,13 @@ import re
 import shlex
 from typing import Any, Optional
 
-COMMAND_TOOLS = frozenset({"terminal", "execute_code"})
-_TEXT_KEYS = ("command", "code", "script", "input")
-_MAX_SCAN = 400_000   # characters read from one argument; what lies beyond is not scanned
+# terminal runs a shell line, execute_code a script, process_manage writes to a running program's input.
+COMMAND_TOOLS = frozenset({"terminal", "execute_code", "process_manage", "process"})
+_TEXT_KEYS = ("command", "code", "script", "input", "data")
+_MAX_SCAN = 400_000   # characters inspected in one argument
 _MAX_DEPTH = 4        # sh -c "ssh host 'sh -c …'"
+TOO_LARGE = "a command too large to inspect"
+_QUOTING = str.maketrans("", "", "'\"\\")
 
 # Nothing below runs unless one of these appears somewhere in the text.
 _HINTS = (
@@ -106,14 +109,26 @@ def detect(tool_name: str, args: Any) -> Optional[str]:
         text = args.get(key)
         if not isinstance(text, str) or not text:
             continue
-        text = text[:_MAX_SCAN]
-        lowered = text.lower()
-        if not any(hint in lowered for hint in _HINTS):
+        # Hints are looked for with quotes and backslashes taken out: a shell reads m's'mtp as msmtp.
+        if not _hinted(text):
             continue
-        label = _scan_code(text) if tool_name == "execute_code" else _scan_shell(text, 0)
+        head, tail = text[:_MAX_SCAN], text[_MAX_SCAN:]
+        if tool_name == "execute_code":
+            label = _scan_code(head)
+        elif tool_name == "terminal":
+            label = _scan_shell(head, 0)
+        else:  # text typed into a running program: it may be a shell or an interpreter
+            label = _scan_shell(head, 0) or _scan_code(head)
         if label:
             return label
+        if tail and _hinted(tail):
+            return TOO_LARGE  # what cannot be read is not waved through
     return None
+
+
+def _hinted(text: str) -> bool:
+    lowered = text.lower().translate(_QUOTING)
+    return any(hint in lowered for hint in _HINTS)
 
 
 # --- shell ------------------------------------------------------------------------------------------
@@ -138,11 +153,29 @@ def _scan_shell(text: str, depth: int) -> Optional[str]:
             line = line[:heredoc.start()] + " " + line[heredoc.end():]
         if not line.strip():
             continue
-        for command in _simple_commands(line):
-            label = _judge(command, body, depth)
+        commands = _simple_commands(line)
+        for position, command in enumerate(commands):
+            label = _judge(command, body, depth) or _fed_by_pipe(command, commands[:position], depth)
             if label:
                 return label
     return None
+
+
+def _fed_by_pipe(command: list[str], earlier: list[list[str]], depth: int) -> Optional[str]:
+    """``echo "…" | sh`` and ``printf … | python3``: the program reads its script from the commands before it."""
+    if not earlier:
+        return None
+    words = _unwrap(command)
+    if not words:
+        return None
+    program, args = _program(words[0]), words[1:]
+    shell, interpreter = program in _SHELLS, bool(_INTERPRETER.match(program))
+    if not (shell or interpreter) or any(arg not in ("-", "-s") and not arg.startswith("-") for arg in args):
+        return None  # it runs a file, not its input
+    fed = "\n".join(" ".join(part[1:]) for part in earlier if len(part) > 1)
+    if not fed:
+        return None
+    return _scan_shell(fed.replace("\\n", "\n"), depth + 1) if shell else _scan_code(fed)
 
 
 def _words(line: str) -> list[str]:

@@ -21,8 +21,9 @@ switches the question off altogether. Signet makes it a rule that code enforces.
   Signet has shown it to you in full.
 - **The usual side doors are shut.** `himalaya message send`, `msmtp`, `sendmail`, `mail`, `mutt`,
   `swaks`, SMTP scripts, mail SDKs and the send endpoints of hosted mail APIs are blocked when the
-  agent tries them directly, with a message that points it back to the sealed path. Commands are
-  read the way a shell reads them, so `git commit -m "fix msmtp docs"` is left alone.
+  agent tries them directly (in `terminal`, `execute_code` or text typed into a running process),
+  with a message that points it back to the sealed path. Commands are read the way a shell reads
+  them, so `git commit -m "fix msmtp docs"` is left alone.
 - **The card points at what a careful reader would check.** A domain that imitates one you know
   (`gmial.com`, `examp1e.org`), a new recipient, a name that shows another address, a token or a
   private key in the text, a link to a bare IP, invisible characters removed. All of it is

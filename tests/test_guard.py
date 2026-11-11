@@ -52,6 +52,13 @@ SENDS = [
     "gws gmail users messages send --params '{}'",
     "python3 google_api.py gmail send --to bob@example.com",
     "osascript -e 'tell application \"Mail\" to send theMessage'",
+    "hima\"laya\" message send < mail.eml",
+    "m's'mtp -t < m",
+    "send\\mail -t < m",
+    "echo 'cat m | msmtp -t' | sh",
+    "printf 'msmtp -t < m\\n' | bash -s",
+    "echo \"import smtplib; smtplib.SMTP('h').sendmail(a, b, c)\" | python3",
+    "cat <<'EOF' | python3 -\nimport smtplib\nsmtplib.SMTP('h').send_message(m)\nEOF",
 ]
 
 HARMLESS = [
@@ -134,6 +141,19 @@ class Guard(unittest.TestCase):
         for code in harmless:
             with self.subTest(code=code):
                 self.assertIsNone(guard.detect("execute_code", {"code": code}))
+
+    def test_text_typed_into_a_running_program(self):
+        self.assertTrue(guard.detect("process_manage", {"action": "submit", "session_id": "proc_1", "data": "msmtp -t < mail.eml"}))
+        self.assertTrue(guard.detect("process_manage", {"action": "write", "data": "import smtplib\nsmtplib.SMTP('h').sendmail(a, b, c)\n"}))
+        self.assertIsNone(guard.detect("process_manage", {"action": "submit", "data": "ls -la"}))
+        self.assertIsNone(guard.detect("process_manage", {"action": "poll", "session_id": "proc_1"}))
+
+    def test_what_is_too_large_to_read_is_not_waved_through(self):
+        padding = "echo padding\n" * 40_000
+        self.assertGreater(len(padding), 400_000)
+        self.assertEqual(guard.detect("terminal", {"command": padding + "msmtp -t < m"}), guard.TOO_LARGE)
+        self.assertIsNone(guard.detect("terminal", {"command": padding + "ls -la"}))
+        self.assertTrue(guard.detect("terminal", {"command": "msmtp -t < m\n" + padding}))
 
     def test_other_tools_and_odd_arguments_are_ignored(self):
         self.assertIsNone(guard.detect("write_file", {"content": "msmtp -t", "path": "notes.md"}))

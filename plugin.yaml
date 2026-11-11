@@ -1,0 +1,98 @@
+name: signet
+version: 0.1.0
+manifest_version: 2
+api_version: 1
+description: "An email leaves your agent only with your seal on that exact message. Signet shows you the real sender, recipients, subject, body and attachments in Hermes's own approval prompt, ties your yes to their SHA-256, and sends nothing else. YOLO mode, approvals off and scheduled runs cannot seal: those emails wait for /signet send. Direct mailers are blocked."
+author: Signet contributors
+license: MIT
+homepage: https://github.com/Wecko-ai/hermes-signet
+tags: [email, approval, security, guardrail, outbox]
+requires_hermes: ">=0.23.0"
+provides_tools:
+  - signet_send_mail
+  - signet_outbox
+provides_hooks:
+  - pre_tool_call
+  - pre_approval_request
+  - post_approval_response
+config_schema:
+  transport:
+    type: str
+    choices: [outbox, command, smtp]
+    default: outbox
+    label: Transport
+    description: "outbox writes approved emails as .eml files and delivers nothing. command gives the message to a local mailer. smtp talks to a server."
+  from_address:
+    type: str
+    default: ""
+    label: Default sender
+    description: "Used when the agent names no sender, for example Ada <ada@example.org>."
+  send_command:
+    type: list
+    default: [himalaya, message, send]
+    label: Mailer command
+    description: "For the command transport: a list of words, run without a shell, that reads one message on standard input. Examples: [msmtp, -t] or [sendmail, -t]."
+  smtp_host:
+    type: str
+    default: ""
+    label: SMTP server
+  smtp_port:
+    type: int
+    default: 0
+    label: SMTP port
+    description: "0 picks 587 (STARTTLS) or 465 (SSL)."
+  smtp_security:
+    type: str
+    choices: [starttls, ssl, none]
+    default: starttls
+    label: SMTP security
+    description: "none is accepted for a server on this machine only."
+  smtp_username:
+    type: str
+    default: ""
+    label: SMTP user
+  smtp_password:
+    type: secret
+    env: SIGNET_SMTP_PASSWORD
+    label: SMTP password
+    description: "Read through Hermes's secret scope when the smtp transport signs in."
+  send_timeout:
+    type: int
+    default: 60
+    label: Transport timeout (seconds)
+  allowed_from:
+    type: list
+    default: []
+    label: Allowed senders
+    description: "When set, a draft from any other address is refused."
+  trusted_recipients:
+    type: list
+    default: []
+    label: Recipients that need no seal
+    description: "Your own addresses. An email whose every recipient is listed here is sent without a prompt, also from a scheduled run."
+  guard:
+    type: str
+    choices: [block, approve, "off"]
+    default: block
+    label: Direct mailers
+    description: "What happens when the agent tries himalaya send, msmtp, sendmail, an SMTP script or a mail API itself: block it, ask you, or let it pass."
+  cron_guard:
+    type: str
+    choices: [block, allow]
+    default: block
+    label: Direct mailers in scheduled runs
+    description: "allow lets cron jobs that mail with their own commands keep working."
+  max_recipients:
+    type: int
+    default: 20
+    label: Most recipients per email
+  preview_chars:
+    type: int
+    default: 900
+    label: Body characters shown in the prompt
+    description: "A longer body shows its start and end; /signet show CODE shows all of it."
+  seal_header:
+    type: bool
+    default: false
+    label: Add an X-Signet-Seal header
+    description: "Stamps the approved fingerprint on the message so it can be matched to the ledger."

@@ -75,6 +75,7 @@ _USAGE = (
     "  /signet show CODE       read a held email in full\n"
     "  /signet send CODE       seal and send a held email (it is shown in full first)\n"
     "  /signet drop CODE       discard a held email\n"
+    "  (CODE can be `last`: the email held most recently)\n"
     "  /signet log [N]         the last N ledger entries (default 10)"
 )
 
@@ -161,15 +162,27 @@ class Signet:
             return False
 
     def build(self, args: Any) -> Draft:
-        draft = build_draft(
-            args if isinstance(args, dict) else {},
-            default_from=str(self.setting("from_address") or ""),
-            base_dir=self._base_dir(),
-            max_recipients=self._number("max_recipients", 1, 500),
-        )
-        allowed = self._address_set("allowed_from")
+        """The draft these arguments make, under the owner's sender rules.
+
+        The agent does not choose who the mail is from: once a sender is configured, a draft may
+        only come from it or from an address listed in ``allowed_from``.
+        """
+        configured = str(self.setting("from_address") or "").strip()
+        try:
+            draft = build_draft(
+                args if isinstance(args, dict) else {},
+                default_from=configured,
+                base_dir=self._base_dir(),
+                max_recipients=self._number("max_recipients", 1, 500),
+            )
+        except DraftError as exc:
+            if configured and str(exc).startswith("from"):
+                raise DraftError(f"{exc}. Leave `from` out: the sender is set in the plugin settings") from exc
+            raise
+        allowed = self._address_set("allowed_from") | self._address_set("from_address")
         if allowed and draft.sender_address not in allowed:
-            raise DraftError(f"the sender {draft.sender_address} is not in allowed_from")
+            hint = "leave `from` out to use the configured sender" if configured else "use a sender listed in allowed_from"
+            raise DraftError(f"the sender {draft.sender_address} is not one the owner allowed; {hint}")
         return draft
 
     def needs_no_seal(self, draft: Draft) -> bool:
@@ -296,6 +309,11 @@ class Signet:
                 outbox.record("held", draft, reason=reason)
                 return _json({"sent": False, "status": "held", "code": code,
                               "message": _HELD.format(code=code, reason=reason)})
+            if seal.get("by", "").startswith("approval:") and outbox.load(code) is None:
+                # The draft was held when the prompt opened. If it is gone, the person has already
+                # sent or dropped it with /signet while the prompt was open: one decision, one email.
+                return _json({"sent": False, "status": "already_handled", "code": code,
+                              "message": "This email was already sent or dropped with /signet while the prompt was open. Nothing more was sent."})
             return _json(self._deliver(draft, seal, outbox))
         except Exception as exc:  # noqa: BLE001
             logger.exception("signet: send failed")
@@ -425,10 +443,16 @@ class Signet:
         return "\n".join(lines)
 
     def _on_held(self, verb: str, argument: str, platform: str) -> str:
-        code = normalize_code(argument)
-        if not code:
-            return f"Usage: /signet {verb} CODE (a code looks like 7F3A-91C2; /signet lists them)."
         outbox = self.outbox()
+        code = normalize_code(argument)
+        if not code and argument.lower() in ("", "last", "latest"):
+            # No code typed: the email held most recently, among those still waiting.
+            waiting = [draft for draft, record in outbox.pending() if record.get("state") != "denied"]
+            if not waiting:
+                return "No email is waiting for you. /signet lists the ones you denied."
+            code = waiting[-1].code
+        if not code:
+            return f"Usage: /signet {verb} CODE, or /signet {verb} last (a code looks like 7F3A-91C2; /signet lists them)."
         loaded = outbox.load(code)
         if loaded is None:
             return f"No held email has the code {code}. /signet lists what is waiting."
@@ -456,7 +480,7 @@ class Signet:
             # A seal covers what its owner has read. Whatever this code points at, show it first.
             self.seals.mark_shown(draft.digest)
             return (self.card(draft, outbox, full=True, title=f"Held email {code} ({status}): this is what would be sent")
-                    + f"\n\nNothing was sent yet. If this is right, run /signet send {code} again to seal and send it.")
+                    + f"\n\nNothing was sent yet. If this is right, run /signet send {code} to seal and send it.")
         # Typing the command a second time, after reading it, is the person's seal on this fingerprint.
         self.seals.forget(draft.digest)  # a prompt still open for this draft must not send it twice
         self.seals.seal(draft.digest, by="command:/signet send", surface=platform)

@@ -71,6 +71,28 @@ Default sender: Ada <ada@example.org>.
 /signet show CODE to read one, /signet send CODE to seal and send it, /signet drop CODE to discard it.
 ```
 
+## In a real session
+
+Captured from Hermes 0.23.0 in a terminal, with a local model and a mail sink on the same machine.
+
+The approval prompt, with the look-alike address caught:
+
+![Hermes approval prompt showing Signet's card: the recipient bob@gmial.com is flagged as looking like gmail.com](docs/screenshots/01-approval-card.png)
+
+Denied, corrected, approved once, delivered; the ledger keeps both decisions:
+
+![The corrected email is allowed once and sent; /signet log lists the denied and the sent email](docs/screenshots/02-sent-and-ledger.png)
+
+In YOLO mode Hermes asks nothing, so nothing is sealed: the email is held until its owner reads and sends it:
+
+![With approvals bypassed the email is held; /signet send shows it in full, then sends it](docs/screenshots/03-yolo-held-then-sealed.png)
+
+The agent is told to pipe a file into `himalaya message send`. The call is blocked, and the agent comes back through the sealed path:
+
+![The direct mailer command is blocked by Signet](docs/screenshots/04-direct-mailer-blocked.png)
+
+![The agent then calls signet_send_mail, and the approval card appears](docs/screenshots/05-back-through-the-seal.png)
+
 ## How it works
 
 ```text
@@ -153,6 +175,8 @@ In Hermes Desktop, every setting below has a row under Settings → Plugins → 
 | `/signet drop CODE` | Discard a held email |
 | `/signet log [N]` | The last N ledger entries |
 
+`CODE` can be `last`: the email held most recently.
+
 Slash commands are typed by a person; the model cannot call them. The model has two tools:
 `signet_send_mail`, and the read-only `signet_outbox` so it can answer "did my email go out?".
 
@@ -161,11 +185,11 @@ Slash commands are typed by a person; the model cannot call them. The model has 
 | Key | Default | Meaning |
 |---|---|---|
 | `transport` | `outbox` | `outbox` (write `.eml`, deliver nothing), `command` or `smtp` |
-| `from_address` | empty | Sender used when the agent names none |
+| `from_address` | empty | The sender. Once it is set, the agent cannot send from any other address unless `allowed_from` lists it |
 | `send_command` | `[himalaya, message, send]` | Mailer for the `command` transport |
 | `smtp_host`, `smtp_port`, `smtp_security`, `smtp_username` | | For the `smtp` transport. `smtp_security: none` is accepted for a server on the same machine only |
 | `send_timeout` | `60` | Seconds the transport may take |
-| `allowed_from` | empty | When set, drafts from any other sender are refused |
+| `allowed_from` | empty | Other senders the agent may use. With no `from_address` and no list, the agent must name a sender and any is accepted |
 | `trusted_recipients` | empty | Your own addresses. An email whose every recipient is listed is sent without a prompt, also from a scheduled run |
 | `guard` | `block` | Direct mailers in a conversation: `block`, `approve` (ask you through Hermes's prompt) or `off` |
 | `cron_guard` | `block` | Direct mailers in scheduled runs: `block` or `allow` (keep cron jobs that mail with their own commands working) |

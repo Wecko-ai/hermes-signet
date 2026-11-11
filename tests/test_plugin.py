@@ -184,6 +184,20 @@ class Policies(Harness):
         self.assertEqual(result["status"], "refused")
         self.assertIn("allowed_from", result["error"])
 
+    def test_the_agent_does_not_choose_the_sender(self):
+        self.ctx.settings["from_address"] = "Ada <ada@example.org>"
+        directive, result = self.call({**MAIL, "from": "Ada <ada@example.com>"})  # an invented look-alike
+        self.assertIsNone(directive)
+        self.assertEqual(result["status"], "refused")
+        self.assertIn("leave `from` out", result["error"])
+        _, result = self.call({**MAIL, "from": "Ada"})  # a name, as a model writes after "sign as Ada"
+        self.assertIn("Leave `from` out", result["error"])
+        _, result = self.call({**MAIL, "from": "ADA@example.org"})  # the configured address itself is fine
+        self.assertEqual(result["status"], "written")
+        self.ctx.settings["allowed_from"] = ["team@example.org"]
+        _, result = self.call({**MAIL, "from": "team@example.org", "subject": "other"})
+        self.assertEqual(result["status"], "written")
+
     def test_default_sender(self):
         self.ctx.settings["from_address"] = "Me <me@example.org>"
         mail = {key: value for key, value in MAIL.items() if key != "from"}
@@ -322,6 +336,19 @@ class Command(Harness):
         self.assertEqual(self.signet.outbox().entries()[-1]["sealed_by"], "command:/signet send")
         self.assertIn("No held email", self.signet.command(f"send {code}"))
 
+    def test_last_names_the_email_held_most_recently(self):
+        self.assertIn("No email is waiting", self.signet.command("send last"))
+        self.hold_one()
+        _, newer = self.call({**MAIL, "subject": "newer"}, gate_open=True)
+        shown = self.signet.command("send last")
+        self.assertIn("newer", shown)
+        self.assertIn("Nothing was sent yet", shown)
+        self.assertIn(f"/signet send {newer['code']}", shown)
+        self.assertIn("Sealed", self.signet.command("send"))
+        self.assertEqual(len(self.eml()), 1)
+        self.assertIn("Q3 figures", self.signet.command("show last"))
+        self.assertIn("Usage", self.signet.command("send nonsense"))
+
     def test_send_right_after_show_needs_no_second_look(self):
         code = self.hold_one()
         self.assertIn("figures attached.", self.signet.command(f"show {code}"))
@@ -362,6 +389,16 @@ class Command(Harness):
         self.assertEqual(json.loads(self.signet.send_mail(MAIL))["status"], "held")
         self.assertEqual(len(self.eml()), 1)
 
+    def test_an_approval_after_the_draft_was_dropped_sends_nothing(self):
+        """Also when the prompt and /signet are served by different processes: the held file is the witness."""
+        directive = self.signet.pre_tool_call(tool_name=schemas.SEND_TOOL, args=MAIL)
+        other_process = plugin.Signet(self.ctx, data_dir=self.data)  # shares the outbox, not the seals
+        self.assertIn("Nothing was sent", other_process.command("drop last"))
+        self.signet.post_approval_response(pattern_key=f"plugin_rule:{directive['rule_key']}", choice="once")
+        result = json.loads(self.signet.send_mail(MAIL))
+        self.assertEqual(result["status"], "already_handled")
+        self.assertEqual(self.eml(), [])
+
     def test_send_refuses_inside_a_scheduled_run(self):
         code = self.hold_one()
         self.ctx.cron = object()
@@ -390,7 +427,7 @@ class Command(Harness):
                             subject="Pay" + chr(0x200B) + "ment", body="hidden" + chr(0x202E) + " text")
         self.signet.outbox().hold(forged, "forged")
         self.ctx.settings["allowed_from"] = ["ada@example.org"]
-        self.assertIn("allowed_from", self.signet.command(f"send {forged.code}"))
+        self.assertIn("not one the owner allowed", self.signet.command(f"send {forged.code}"))
         self.ctx.settings["allowed_from"] = []
         self.assertIn("not a draft Signet would have written", self.signet.command(f"send {forged.code}"))
         self.assertIn("not a draft Signet would have written", self.signet.command(f"send {forged.code}"))
@@ -408,7 +445,7 @@ class Command(Harness):
         self.call(MAIL)
         self.assertIn("sent", self.signet.command("log"))
         self.assertIn("/signet send CODE", self.signet.command("what"))
-        self.assertIn("Usage", self.signet.command("send"))
+        self.assertIn("Usage", self.signet.command("send what"))
 
     def test_outbox_tool_is_read_only_and_has_no_bodies(self):
         self.hold_one()

@@ -31,7 +31,7 @@ SEND_MAIL = {
             "body": {"type": "string", "description": "Body, in plain text."},
             "from": {
                 "type": "string",
-                "description": "Sender address. Leave it out to use the address set in the plugin settings.",
+                "description": "Leave this out: the sender is set in the plugin settings. Give an address only when the user asked for a specific sender.",
             },
             "in_reply_to": {
                 "type": "string",

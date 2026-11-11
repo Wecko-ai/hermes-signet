@@ -26,7 +26,7 @@ config_schema:
     type: str
     default: ""
     label: Default sender
-    description: "Used when the agent names no sender, for example Ada <ada@example.org>."
+    description: "For example Ada <ada@example.org>. Once set, the agent cannot send from another address unless allowed_from lists it."
   send_command:
     type: list
     default: [himalaya, message, send]
@@ -64,7 +64,7 @@ config_schema:
     type: list
     default: []
     label: Allowed senders
-    description: "When set, a draft from any other address is refused."
+    description: "Other addresses the agent may send from."
   trusted_recipients:
     type: list
     default: []

@@ -453,7 +453,7 @@ class Transports(Harness):
         self.assertEqual(received["from"], "ada@example.org")
         self.assertEqual(received["to"], ["bob@example.com", "carol@example.com"])
         message = BytesParser(policy=policy.default).parsebytes(received["data"])
-        self.assertEqual(message["X-Signet-Seal"], self.signet.build({**MAIL, "cc": ["Carol <carol@example.com>"], "attachments": [str(report)]}).digest)
+        self.assertEqual(str(message["X-Signet-Seal"]).strip(), self.signet.build({**MAIL, "cc": ["Carol <carol@example.com>"], "attachments": [str(report)]}).digest)
         self.assertEqual([part.get_filename() for part in message.iter_attachments()], ["report.txt"])
 
     def test_plain_smtp_is_for_this_machine_only(self):

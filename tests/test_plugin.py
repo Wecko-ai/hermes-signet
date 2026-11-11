@@ -399,6 +399,34 @@ class Command(Harness):
         self.assertEqual(result["status"], "already_handled")
         self.assertEqual(self.eml(), [])
 
+    def test_two_senders_of_the_same_held_email_cannot_both_send(self):
+        """The approval path and /signet send race for one file: a rename is won once."""
+        outbox = self.signet.outbox()
+        code = self.hold_one()
+        self.assertTrue(outbox.claim(code))
+        self.assertFalse(outbox.claim(code))
+        self.assertEqual(self.held(), [])
+        outbox.settle(code)
+        # In the plugin: the approval arrives after /signet send took the email.
+        directive = self.signet.pre_tool_call(tool_name=schemas.SEND_TOOL, args={**MAIL, "subject": "race"})
+        self.signet.post_approval_response(pattern_key=f"plugin_rule:{directive['rule_key']}", choice="once")
+        raced = self.signet.build({**MAIL, "subject": "race"}).code
+        self.assertTrue(self.signet.outbox().claim(raced))  # the other process got there first
+        self.assertEqual(json.loads(self.signet.send_mail({**MAIL, "subject": "race"}))["status"], "already_handled")
+        self.assertEqual(self.eml(), [])
+
+    def test_a_send_that_died_gives_the_email_back_marked(self):
+        code = self.hold_one()
+        outbox = self.signet.outbox()
+        self.assertTrue(outbox.claim(code))
+        claimed = self.data / "sending" / f"{code}.json"
+        old = claimed.stat().st_mtime - 700
+        __import__("os").utime(claimed, (old, old))
+        (draft, record), = outbox.pending()
+        self.assertEqual(record["state"], "failed")
+        self.assertIn("may or may not have left", record["reason"])
+        self.assertFalse(claimed.exists())
+
     def test_send_refuses_inside_a_scheduled_run(self):
         code = self.hold_one()
         self.ctx.cron = object()

@@ -269,7 +269,8 @@ The unit tests need nothing but Python 3.11+. They cover the fingerprint, header
 encoded words and accented names (the card against the bytes on the wire), invisible characters,
 look-alike domains, the guard's block and allow tables and its running time on hostile input,
 single-use seals, tampering between prompt and send, held drafts edited, forged or swapped on disk,
-nonsense settings, and the three transports (with a local SMTP sink).
+two senders racing for one held email, nonsense settings, and the three transports (with a local
+SMTP sink).
 
 `tests/hermes_integration.py` loads the plugin with the real Hermes plugin manager and sends
 `signet_send_mail` through the real tool dispatch and approval gate, with a callback standing in

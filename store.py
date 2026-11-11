@@ -23,6 +23,7 @@ _SEAL_TTL = 300
 _MAX_TRACKED = 500
 DENIED_KEPT = 24 * 3600
 MAX_HELD = 200
+INTERRUPTED_AFTER = 600
 _SHOWN_TTL = 3600
 _LEDGER_TAIL = 5000
 _FILES = threading.Lock()  # one lock for the files of every profile served by this process
@@ -190,6 +191,40 @@ class Outbox:
             except OSError:
                 pass
 
+    def claim(self, code: str) -> bool:
+        """Take the held draft for sending. Only one caller, in any process, gets ``True``:
+        the file is renamed, and a rename succeeds once."""
+        code = normalize_code(code)
+        if not code:
+            return False
+        try:
+            os.rename(self._pending_path(code), self._dir("sending") / f"{code}.json")
+        except OSError:
+            return False
+        return True
+
+    def settle(self, code: str) -> None:
+        """Forget a claim once the send has ended, whatever its outcome."""
+        code = normalize_code(code)
+        if code:
+            try:
+                (self._dir("sending") / f"{code}.json").unlink()
+            except OSError:
+                pass
+
+    def _recover_interrupted(self, now: float) -> None:
+        """A claim older than ten minutes belongs to a send that died: give the draft back, marked."""
+        for path in self._dir("sending").glob("*.json"):
+            try:
+                if now - path.stat().st_mtime < INTERRUPTED_AFTER:
+                    continue
+                record = json.loads(path.read_text(encoding="utf-8"))
+                record.update(state="failed", reason="a send was interrupted: this email may or may not have left")
+                _write_private(self._pending_path(path.stem), json.dumps(record, ensure_ascii=False, indent=1))
+                path.unlink()
+            except Exception:  # noqa: BLE001 - a damaged claim is left where it is
+                continue
+
     def release(self, code: str) -> None:
         code = normalize_code(code)
         if code:
@@ -203,6 +238,7 @@ class Outbox:
         """Every held draft, oldest first. A draft the person denied is kept one day, then removed."""
         items = []
         now = time.time()
+        self._recover_interrupted(now)
         for path in sorted(self._dir("pending").glob("*.json")):
             loaded = self.load(path.stem)
             if not loaded:

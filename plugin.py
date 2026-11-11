@@ -309,9 +309,10 @@ class Signet:
                 outbox.record("held", draft, reason=reason)
                 return _json({"sent": False, "status": "held", "code": code,
                               "message": _HELD.format(code=code, reason=reason)})
-            if seal.get("by", "").startswith("approval:") and outbox.load(code) is None:
-                # The draft was held when the prompt opened. If it is gone, the person has already
-                # sent or dropped it with /signet while the prompt was open: one decision, one email.
+            if seal.get("by", "").startswith("approval:") and not outbox.claim(code):
+                # The draft was held when the prompt opened. Whoever takes the held file sends, and
+                # only one can take it: if it is gone, the person already sent or dropped it with
+                # /signet while the prompt was open. One decision, one email.
                 return _json({"sent": False, "status": "already_handled", "code": code,
                               "message": "This email was already sent or dropped with /signet while the prompt was open. Nothing more was sent."})
             return _json(self._deliver(draft, seal, outbox))
@@ -326,6 +327,7 @@ class Signet:
                   "transport": delivery.transport, "detail": delivery.detail}
         if not delivery.ok:
             self._bookkeeping(lambda: outbox.hold(draft, delivery.detail, state="failed"),
+                              lambda: outbox.settle(draft.code),
                               lambda: outbox.record("failed", draft, sealed_by=seal.get("by"),
                                                     transport=delivery.transport, detail=delivery.detail))
             return {"sent": False, "status": "failed", **common,
@@ -334,6 +336,7 @@ class Signet:
         # The email has left (or was written): whatever happens to the records now, say so.
         complete = self._bookkeeping(
             lambda: outbox.release(draft.code),
+            lambda: outbox.settle(draft.code),
             lambda: outbox.record("sent", draft, sealed_by=seal.get("by"), surface=seal.get("surface"),
                                   transport=delivery.transport, message_id=delivery.message_id,
                                   delivered=delivery.delivered))
@@ -485,8 +488,8 @@ class Signet:
         self.seals.forget(draft.digest)  # a prompt still open for this draft must not send it twice
         self.seals.seal(draft.digest, by="command:/signet send", surface=platform)
         seal = self.seals.consume(draft.digest)
-        if seal is None:
-            return f"Not sent: another send of {code} is under way."
+        if seal is None or not outbox.claim(code):
+            return f"Not sent: {code} is already being sent, or was just sent."
         result = self._deliver(draft, seal, outbox)
         if result["status"] == "sent":
             return f"Sent {one_line(draft)} ({result['detail']})."

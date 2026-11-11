@@ -10,7 +10,7 @@ import json
 import re
 import unicodedata
 from dataclasses import dataclass
-from email.utils import formataddr, getaddresses
+from email import policy as email_policy
 from pathlib import Path
 from typing import Any, Iterable, Optional
 from urllib.parse import urlsplit
@@ -26,29 +26,32 @@ class DraftError(ValueError):
     """The draft cannot be sent as written. The message is safe to show to the model."""
 
 
-# Zero-width and bidirectional controls: text a reader cannot see on the card must not travel.
-_INVISIBLE_RANGES = ((0x00AD, 0x00AD), (0x180E, 0x180E), (0x200B, 0x200F), (0x202A, 0x202E),
-                     (0x2060, 0x2064), (0x2066, 0x2069), (0xFEFF, 0xFEFF))
-_INVISIBLE = re.compile("[" + "".join(f"\\u{low:04x}-\\u{high:04x}" for low, high in _INVISIBLE_RANGES) + "]")
-_CONTROL = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _ADDRESS = re.compile(
     r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]{1,64}@"
     r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$"
 )
 _MESSAGE_ID = re.compile(r"^<[^<>\s]{1,300}>$")
+# An RFC 2047 encoded word: a mail client shows its decoded text, not what is written here.
+_ENCODED_WORD = re.compile(r"=\?[^?\s]{1,40}\?[bBqQ]\?[^?\s]*\?=")
 _URL = re.compile(r"https?://[^\s<>\"')\]]+", re.IGNORECASE)
 _ADDRESS_IN_TEXT = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 _IPV4 = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+_NAME_NEEDS_QUOTES = re.compile(r"[,;:@()\[\].]")
+_MAILBOX = re.compile(r'^(?:"([^"<>]*)"|([^"<>]*?))\s*<([^<>\s]+)>$')
 
-# File names that hold credentials. Signet refuses to attach them: a person who really wants to
-# mail a key can do it by hand.
+# File names and places that hold credentials. Signet refuses to attach them: a person who really
+# wants to mail a key can do it by hand.
 _CREDENTIAL_NAMES = re.compile(
-    r"(?:^|/)(?:\.env(?:\.[\w.-]+)?|\.netrc|\.pgpass|auth\.json|credentials(?:\.json)?|"
-    r"id_(?:rsa|dsa|ecdsa|ed25519)|[\w.-]+\.(?:pem|p12|pfx|keychain|kdbx))$",
+    r"(?:^|/)(?:\.env(?:\.[\w.-]+)?|\.netrc|\.pgpass|\.npmrc|\.pypirc|\.git-credentials|auth\.json|token\.json|"
+    r"credentials(?:\.json)?|id_(?:rsa|dsa|ecdsa|ed25519)|[\w.-]+\.(?:pem|p8|p12|pfx|keychain|kdbx))$",
     re.IGNORECASE,
 )
+_CREDENTIAL_DIRS = re.compile(
+    r"(?:^|/)(?:\.(?:ssh|aws|gnupg|kube|docker|azure|password-store)|\.config/(?:gh|gcloud|op|himalaya)|secrets)/",
+    re.IGNORECASE,
+)
+_SYSTEM_DIRS = re.compile(r"^/(?:proc|sys|dev)(?:/|$)")
 _PRIVATE_KEY_BYTES = re.compile(rb"-----BEGIN [A-Z ]*PRIVATE KEY-----")
-_CREDENTIAL_DIRS = re.compile(r"(?:^|/)\.(?:ssh|aws|gnupg|kube)/", re.IGNORECASE)
 
 _SECRET_PATTERNS = (
     ("a private key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
@@ -65,6 +68,50 @@ _COMMON_DOMAINS = frozenset({
     "icloud.com", "me.com", "proton.me", "protonmail.com", "aol.com", "gmx.com", "fastmail.com",
 })
 
+# --- Characters a reader cannot see ---------------------------------------------------------------
+# Written as code points on purpose: this file holds no invisible character itself.
+_JOINERS = frozenset({0x200C, 0x200D})            # needed by Persian, Indic scripts and emoji sequences
+_EMOJI_SELECTORS = frozenset({0xFE0E, 0xFE0F})    # text / emoji presentation
+_BLANK_LETTERS = frozenset({0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x2800, 0x3164, 0xFFA0})
+_LINE_BREAKS = dict.fromkeys((0x0B, 0x0C, 0x1C, 0x1D, 0x1E, 0x85, 0x2028, 0x2029), "\n")
+
+
+def _strip_hidden(text: str) -> tuple[str, int]:
+    """Remove what does not show on a card: format and control characters, variation selectors,
+    blank "letters". A joiner or an emoji selector stays only where it does its visible job,
+    right after a non-ASCII character."""
+    kept: list[str] = []
+    removed = 0
+    for char in text:
+        code = ord(char)
+        if char in "\n\t" or (0x20 <= code < 0x7F):
+            kept.append(char)
+            continue
+        category = unicodedata.category(char)
+        after_wide = bool(kept) and ord(kept[-1]) > 0x7F and ord(kept[-1]) not in _JOINERS
+        if category in ("Cc", "Co", "Cs"):
+            keep = False
+        elif category == "Cf":
+            keep = code in _JOINERS and after_wide
+        elif code in _EMOJI_SELECTORS:
+            keep = after_wide
+        elif 0xFE00 <= code <= 0xFE0F or 0xE0100 <= code <= 0xE01EF or code in _BLANK_LETTERS:
+            keep = False
+        else:
+            keep = True
+        if keep:
+            kept.append(char)
+        else:
+            removed += 1
+    return "".join(kept), removed
+
+
+def _encodable(value: str, what: str) -> None:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise DraftError(f"{what} contains characters that cannot be sent") from exc
+
 
 @dataclass(frozen=True)
 class Attachment:
@@ -76,7 +123,11 @@ class Attachment:
 
 @dataclass(frozen=True)
 class Draft:
-    """One outgoing email in canonical form. Immutable: a change is a new draft, with a new seal."""
+    """One outgoing email in canonical form. Immutable: a change is a new draft, with a new seal.
+
+    ``sender``, ``to`` and ``cc`` hold mailboxes written for a reader, ``Name <address>`` or a
+    bare address, exactly as the card prints them.
+    """
 
     sender: str
     to: tuple[str, ...]
@@ -84,28 +135,32 @@ class Draft:
     subject: str
     body: str
     in_reply_to: str = ""
-    references: str = ""
     attachments: tuple[Attachment, ...] = ()
     removed_invisible: int = 0
 
     @property
     def sender_address(self) -> str:
-        return _address_of(self.sender)
+        return split_mailbox(self.sender)[1].lower()
 
     @property
     def recipient_addresses(self) -> list[str]:
-        return [_address_of(value) for value in (*self.to, *self.cc)]
+        """Lower-cased addresses, for comparing."""
+        return [split_mailbox(value)[1].lower() for value in (*self.to, *self.cc)]
+
+    @property
+    def envelope_recipients(self) -> list[str]:
+        """Addresses as written, for the transport."""
+        return [split_mailbox(value)[1] for value in (*self.to, *self.cc)]
 
     def canonical(self) -> dict[str, Any]:
         return {
-            "v": 1,
+            "v": 2,
             "from": self.sender,
             "to": list(self.to),
             "cc": list(self.cc),
             "subject": self.subject,
             "body": self.body,
             "in_reply_to": self.in_reply_to,
-            "references": self.references,
             "attachments": [[item.name, item.size, item.sha256] for item in self.attachments],
         }
 
@@ -140,23 +195,34 @@ def normalize_code(text: str) -> str:
     return f"{compact[:4]}-{compact[4:]}" if len(compact) == 8 else ""
 
 
-def _address_of(formatted: str) -> str:
-    pairs = getaddresses([formatted])
-    return pairs[0][1].lower() if pairs else ""
+def format_mailbox(name: str, address: str) -> str:
+    if not name:
+        return address
+    return f'"{name}" <{address}>' if _NAME_NEEDS_QUOTES.search(name) else f"{name} <{address}>"
+
+
+def split_mailbox(formatted: str) -> tuple[str, str]:
+    """``(name, address)`` of a mailbox written by :func:`format_mailbox`."""
+    match = _MAILBOX.match(formatted or "")
+    if not match:
+        return "", (formatted or "").strip()
+    return (match.group(1) if match.group(1) is not None else match.group(2)).strip(), match.group(3)
 
 
 def _clean_line(value: Any, what: str, limit: int) -> tuple[str, int]:
-    """One header value: text on a single line, without invisible characters."""
+    """One header value: readable text on a single line."""
     if value is None:
         return "", 0
     if not isinstance(value, str):
         raise DraftError(f"{what} must be text")
-    if "\n" in value or "\r" in value:
+    _encodable(value, what)
+    if len(value.splitlines()) > 1 or value[-1:] in ("\n", "\r"):
         raise DraftError(f"{what} contains a line break, which a mail header cannot hold")
-    text = unicodedata.normalize("NFC", value)
-    cleaned = _CONTROL.sub("", _INVISIBLE.sub("", text))
-    removed = len(text) - len(cleaned)
+    text = unicodedata.normalize("NFC", value).replace("\t", " ")
+    cleaned, removed = _strip_hidden(text)
     cleaned = cleaned.strip()
+    if _ENCODED_WORD.search(cleaned):
+        raise DraftError(f"{what} contains an encoded word (=?...?=): write it as plain text, so the card shows what the reader will see")
     if len(cleaned) > limit:
         raise DraftError(f"{what} is longer than {limit} characters")
     return cleaned, removed
@@ -173,34 +239,39 @@ def _as_list(value: Any, what: str) -> list[str]:
 
 
 def _parse_addresses(value: Any, what: str) -> tuple[list[str], int]:
-    """Formatted, validated, de-duplicated addresses. Display names are kept, cleaned."""
+    """Validated, de-duplicated mailboxes, each written the way the card shows it."""
     removed = 0
-    lines = []
+    result: list[str] = []
+    seen: set[str] = set()
     for raw in _as_list(value, what):
         cleaned, count = _clean_line(raw, what, 2000)
         removed += count
-        if cleaned:
-            lines.append(cleaned)
-    result: list[str] = []
-    seen: set[str] = set()
-    for name, address in getaddresses(lines):
-        address = address.strip()
-        if not address and not name:
+        if not cleaned:
             continue
-        if "@" not in address:
-            raise DraftError(f"{what}: “{address or name}” is not an email address")
-        local, _, domain = address.rpartition("@")
         try:
-            domain = domain.encode("idna").decode("ascii").lower()
-        except UnicodeError as exc:
-            raise DraftError(f"{what}: the domain of “{address}” is not valid") from exc
-        address = f"{local}@{domain}"
-        if not _ADDRESS.match(address):
-            raise DraftError(f"{what}: “{address}” is not a valid email address")
-        if address.lower() in seen:
-            continue
-        seen.add(address.lower())
-        result.append(formataddr((name.strip(), address)) if name.strip() else address)
+            header = email_policy.default.header_factory("To", cleaned)
+            groups = list(header.groups)
+            defects = list(header.defects)
+            addresses = list(header.addresses)
+        except Exception as exc:  # noqa: BLE001 - whatever the parser dislikes is not an address list
+            raise DraftError(f"{what}: could not read “{cleaned}” as email addresses") from exc
+        if defects or any(group.display_name is not None for group in groups) or not addresses:
+            raise DraftError(f"{what}: could not read “{cleaned}” as email addresses (separate them with commas)")
+        for parsed in addresses:
+            name = " ".join((parsed.display_name or "").replace('"', "").split())
+            if "<" in name or ">" in name or _ENCODED_WORD.search(name):
+                raise DraftError(f"{what}: the name “{name}” would not show as written")
+            try:
+                domain = (parsed.domain or "").encode("idna").decode("ascii").lower()
+            except UnicodeError as exc:
+                raise DraftError(f"{what}: the domain of “{parsed.addr_spec}” is not valid") from exc
+            address = f"{parsed.username}@{domain}"
+            if not _ADDRESS.match(address):
+                raise DraftError(f"{what}: “{parsed.addr_spec or cleaned}” is not a valid email address")
+            if address.lower() in seen:
+                continue
+            seen.add(address.lower())
+            result.append(format_mailbox(name, address))
     return result, removed
 
 
@@ -209,26 +280,20 @@ def _clean_body(value: Any) -> tuple[str, int]:
         return "", 0
     if not isinstance(value, str):
         raise DraftError("body must be text")
-    text = unicodedata.normalize("NFC", value).replace("\r\n", "\n").replace("\r", "\n")
-    cleaned = _CONTROL.sub("", _INVISIBLE.sub("", text))
-    removed = len(text) - len(cleaned)
+    _encodable(value, "body")
+    text = unicodedata.normalize("NFC", value).replace("\r\n", "\n").replace("\r", "\n").translate(_LINE_BREAKS)
+    cleaned, removed = _strip_hidden(text)
     cleaned = "\n".join(line.rstrip() for line in cleaned.split("\n")).strip("\n")
     if len(cleaned) > MAX_BODY_CHARS:
         raise DraftError(f"body is longer than {MAX_BODY_CHARS:,} characters")
     return cleaned, removed
 
 
-def _message_ids(value: Any, what: str, *, many: bool) -> str:
-    text, _ = _clean_line(value, what, 4000)
-    if not text:
-        return ""
-    tokens = text.split()
-    if not many and len(tokens) != 1:
+def _message_id(value: Any, what: str) -> str:
+    text, _ = _clean_line(value, what, 320)
+    if text and not _MESSAGE_ID.match(text):
         raise DraftError(f"{what} must be one message id like <id@host>")
-    for token in tokens:
-        if not _MESSAGE_ID.match(token):
-            raise DraftError(f"{what}: “{token}” is not a message id like <id@host>")
-    return " ".join(tokens)
+    return text
 
 
 def is_credential_path(path: str) -> bool:
@@ -237,25 +302,27 @@ def is_credential_path(path: str) -> bool:
 
 
 def _read_attachment(raw: str, base_dir: Optional[Path]) -> Attachment:
-    path = Path(raw).expanduser()
-    if not path.is_absolute():
-        path = (base_dir or Path.cwd()) / path
     try:
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            path = (base_dir or Path.cwd()) / path
         resolved = path.resolve(strict=True)
-    except OSError as exc:
-        raise DraftError(f"attachment not found: {raw}") from exc
-    if not resolved.is_file():
-        raise DraftError(f"attachment is not a file: {raw}")
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise DraftError(f"attachment not found: {raw!r}") from exc
+    if _SYSTEM_DIRS.match(str(resolved)) or not resolved.is_file():
+        raise DraftError(f"attachment is not a regular file: {raw}")
     if is_credential_path(str(resolved)) or is_credential_path(str(path)):
         raise DraftError(f"attachment refused: “{resolved.name}” looks like a credential file")
     name, _ = _clean_line(resolved.name, "attachment name", 255)
     hasher = hashlib.sha256()
     size = 0
+    carried = b""  # the end of the previous chunk, so a marker cut in two is still found
     try:
         with resolved.open("rb") as handle:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                if size == 0 and _PRIVATE_KEY_BYTES.search(chunk[:8192]):
+                if _PRIVATE_KEY_BYTES.search(carried + chunk):
                     raise DraftError(f"attachment refused: “{resolved.name}” contains a private key")
+                carried = chunk[-64:]
                 size += len(chunk)
                 if size > MAX_ATTACHMENT_BYTES:
                     raise DraftError(f"attachment too large: {raw}")
@@ -279,12 +346,12 @@ def build_draft(
     """
     if not isinstance(args, dict):
         raise DraftError("arguments must be an object")
-    known = {"from", "to", "cc", "subject", "body", "in_reply_to", "references", "attachments"}
-    unknown = sorted(key for key, value in args.items() if key not in known and value not in (None, "", [], ()))
+    known = {"from", "to", "cc", "subject", "body", "in_reply_to", "attachments"}
+    unknown = sorted(str(key) for key, value in args.items() if key not in known and value not in (None, "", [], ()))
     if unknown:
         raise DraftError(
             "unsupported field(s): " + ", ".join(unknown)
-            + ". Signet sends From, To, Cc, Subject, body, thread ids and attachments, all shown to the user"
+            + ". Signet sends From, To, Cc, Subject, body, the id of the mail being answered and attachments, all shown to the user"
         )
     removed = 0
     senders, count = _parse_addresses(args.get("from") or default_from, "from")
@@ -295,8 +362,8 @@ def build_draft(
     removed += count
     cc, count = _parse_addresses(args.get("cc"), "cc")
     removed += count
-    to_addresses = {_address_of(value) for value in to}
-    cc = [value for value in cc if _address_of(value) not in to_addresses]
+    to_addresses = {split_mailbox(value)[1].lower() for value in to}
+    cc = [value for value in cc if split_mailbox(value)[1].lower() not in to_addresses]
     if not to:
         raise DraftError("to must name at least one recipient")
     if len(to) + len(cc) > max_recipients:
@@ -321,8 +388,7 @@ def build_draft(
         cc=tuple(cc),
         subject=subject,
         body=body,
-        in_reply_to=_message_ids(args.get("in_reply_to"), "in_reply_to", many=False),
-        references=_message_ids(args.get("references"), "references", many=True),
+        in_reply_to=_message_id(args.get("in_reply_to"), "in_reply_to"),
         attachments=attachments,
         removed_invisible=removed,
     )
@@ -332,17 +398,29 @@ def draft_from_record(record: dict[str, Any]) -> Draft:
     """Rebuild a queued draft exactly as stored, without touching the file system."""
     return Draft(
         sender=str(record["from"]),
-        to=tuple(record.get("to") or ()),
-        cc=tuple(record.get("cc") or ()),
+        to=tuple(str(value) for value in record.get("to") or ()),
+        cc=tuple(str(value) for value in record.get("cc") or ()),
         subject=str(record.get("subject") or ""),
         body=str(record.get("body") or ""),
         in_reply_to=str(record.get("in_reply_to") or ""),
-        references=str(record.get("references") or ""),
         attachments=tuple(
             Attachment(path=str(item["path"]), name=str(item["name"]), size=int(item["size"]), sha256=str(item["sha256"]))
             for item in record.get("attachments") or ()
         ),
     )
+
+
+def record_to_args(record: dict[str, Any]) -> dict[str, Any]:
+    """The tool arguments that would produce this stored draft, to pass it through build_draft again."""
+    return {
+        "from": record.get("from"),
+        "to": list(record.get("to") or ()),
+        "cc": list(record.get("cc") or ()),
+        "subject": record.get("subject"),
+        "body": record.get("body"),
+        "in_reply_to": record.get("in_reply_to"),
+        "attachments": [item.get("path") for item in record.get("attachments") or () if isinstance(item, dict)],
+    }
 
 
 def verify_attachments(draft: Draft) -> None:
@@ -412,53 +490,67 @@ def link_hosts(text: str) -> tuple[list[str], list[str]]:
             hosts.append(host)
         reason = ""
         if "@" in parts.netloc:
-            reason = "hides its real host behind an @"
+            reason = "that hides its real host behind an @"
         elif _IPV4.match(host):
-            reason = "points at a bare IP address"
+            reason = "to a bare IP address"
         elif "xn--" in host or not host.isascii():
-            reason = "uses an internationalised (look-alike capable) name"
-        if reason and f"{host} {reason}" not in odd:
-            odd.append(f"{host} {reason}")
+            reason = "with an internationalised (look-alike capable) name"
+        if reason and f"A link {reason}: {host}" not in odd:
+            odd.append(f"A link {reason}: {host}")
     return hosts, odd
 
 
-def risk_notes(draft: Draft, *, known_addresses: Iterable[str] = (), flag_new: bool = True) -> list[str]:
-    """Plain, deterministic observations about a draft. No model is asked; nothing leaves."""
+def risk_notes(draft: Draft, *, known_addresses: Iterable[str] = ()) -> list[str]:
+    """Plain, deterministic observations about a draft. No model is asked; nothing leaves.
+
+    Warnings start with ``⚠`` and are short: the card shows them right under the recipients, where
+    the narrowest approval prompt still has room for them.
+    """
     notes: list[str] = []
     known = {value.lower() for value in known_addresses}
     known_domains = {value.rpartition("@")[2] for value in known}
     reference_domains = known_domains | _COMMON_DOMAINS | {draft.sender_address.rpartition("@")[2]}
+    new: list[str] = []
     for formatted in (*draft.to, *draft.cc):
-        name, address = getaddresses([formatted])[0]
+        name, address = split_mailbox(formatted)
         address = address.lower()
         domain = address.rpartition("@")[2]
         imitated = lookalike_of(domain, reference_domains)
         if imitated:
-            notes.append(f"⚠ {address}: the domain looks like {imitated} but is not. Check the spelling.")
+            notes.append(f"⚠ {address}: looks like {imitated} but is not")
         elif domain.startswith("xn--") or ".xn--" in domain:
-            notes.append(f"⚠ {address}: internationalised domain, shown here in its real (punycode) form.")
-        if flag_new and address not in known:
-            notes.append(f"First email to {address} from this agent.")
+            notes.append(f"⚠ {address}: internationalised domain, shown in its real (punycode) form")
+        if address not in known:
+            new.append(address)
         shown = _ADDRESS_IN_TEXT.search(name or "")
         if shown and shown.group(0).lower() != address:
-            notes.append(f"⚠ The display name shows {shown.group(0)} but the mail goes to {address}.")
+            notes.append(f"⚠ The name shows {shown.group(0)} but the mail goes to {address}")
+    for label in find_secrets(draft.subject + "\n" + draft.body):
+        notes.append(f"⚠ The text seems to contain {label}")
+    hosts, odd = link_hosts(draft.body)
+    notes.extend(f"⚠ {item}" for item in odd)
+    if new:
+        more = f" (+{len(new) - 3} more)" if len(new) > 3 else ""
+        notes.append(f"New recipient{'s' if len(new) > 1 else ''}: {', '.join(new[:3])}{more}")
     count = len(draft.to) + len(draft.cc)
     if count > 5:
-        notes.append(f"{count} recipients.")
-    for label in find_secrets(draft.subject + "\n" + draft.body):
-        notes.append(f"⚠ The text seems to contain {label}.")
-    hosts, odd = link_hosts(draft.body)
+        notes.append(f"{count} recipients")
     if hosts:
-        shown_hosts = ", ".join(hosts[:5]) + (f" and {len(hosts) - 5} more" if len(hosts) > 5 else "")
-        notes.append(f"Links to: {shown_hosts}.")
-    for item in odd:
-        notes.append(f"⚠ A link to {item}.")
+        notes.append("Links: " + ", ".join(hosts[:4]) + (f" (+{len(hosts) - 4} more)" if len(hosts) > 4 else ""))
     if draft.removed_invisible:
-        notes.append(f"{draft.removed_invisible} invisible character(s) were removed from the draft.")
+        notes.append(f"{draft.removed_invisible} invisible character(s) removed from the draft")
     return notes
 
 
 # --- The card -----------------------------------------------------------------------------------
+
+# The classic Hermes CLI shows at most ten rows of an approval reason, about sixty columns wide,
+# and cuts the rest. The card is therefore ordered by what must not be missed: the seal code,
+# the recipients, the warnings, then sender, subject, and the text.
+_PROMPT_ROWS = 10
+_PROMPT_COLUMNS = 58
+BODY_MARK = "│ "  # every line of the email's own text carries it, so the text cannot pose as a card line
+
 
 def _human_size(size: int) -> str:
     if size < 1024:
@@ -468,34 +560,44 @@ def _human_size(size: int) -> str:
     return f"{size / (1024 * 1024):.1f} MB"
 
 
+def _rows(lines: Iterable[str]) -> int:
+    return sum(max(1, -(-len(part) // _PROMPT_COLUMNS)) for line in lines for part in line.split("\n"))
+
+
+def _quote(text: str) -> list[str]:
+    return [f"{BODY_MARK}{line}".rstrip() for line in text.split("\n")]
+
+
 def render_card(draft: Draft, notes: Iterable[str] = (), *, preview_chars: int = 900, title: str = "") -> str:
-    """The text a person approves. ``preview_chars <= 0`` shows the whole body."""
-    lines = [title or "Email waiting for your seal", ""]
-    lines.append(f"From:    {draft.sender}")
-    lines.append(f"To:      {', '.join(draft.to)}")
+    """The text a person approves. ``preview_chars <= 0`` shows the whole body (``/signet show``)."""
+    notes = list(notes)
+    warnings = [note for note in notes if note.startswith("⚠")]
+    remarks = [note for note in notes if not note.startswith("⚠")]
+    head = [f"To:      {', '.join(draft.to)}"]
     if draft.cc:
-        lines.append(f"Cc:      {', '.join(draft.cc)}")
-    lines.append(f"Subject: {draft.subject or '(no subject)'}")
+        head.append(f"Cc:      {', '.join(draft.cc)}")
+    head.extend(warnings)
+    head.append(f"From:    {draft.sender}")
+    head.append(f"Subject: {draft.subject or '(no subject)'}")
     if draft.in_reply_to:
-        lines.append(f"Reply to: {draft.in_reply_to}")
+        head.append(f"Answers: {draft.in_reply_to}")
     for item in draft.attachments:
-        lines.append(f"Attached: {item.name} ({_human_size(item.size)}, sha256 {item.sha256[:12]}…)")
-    lines.append("")
+        head.append(f"Attached: {item.name} ({_human_size(item.size)}, sha256 {item.sha256[:12]}…)")
+        head.append(f"          from {item.path}")
+    head.extend(remarks)
     body = draft.body or "(empty body)"
+    text = _quote(body)
     if preview_chars > 0 and len(body) > preview_chars:
         tail = max(120, preview_chars // 5)
-        head = preview_chars - tail
-        hidden = len(body) - head - tail
-        lines.append(body[:head].rstrip())
-        lines.append(f"[… {hidden:,} characters not shown here. Deny, then /signet show {draft.code} to read all …]")
-        lines.append(body[-tail:].lstrip())
-    else:
-        lines.append(body)
-    lines.append("")
-    notes = list(notes)
-    if notes:
-        lines.extend(f"• {note}" for note in notes)
-        lines.append("")
+        cut = preview_chars - tail
+        text = [*_quote(body[:cut].rstrip()),
+                f"[… {len(body) - cut - tail:,} characters not shown: deny, then /signet show {draft.code} …]",
+                *_quote(body[-tail:].lstrip())]
+    lines = [title or f"Seal {draft.code}: approve to send exactly this email"]
+    if preview_chars > 0 and _rows([*lines, *head, *text]) > _PROMPT_ROWS:
+        lines.append(f"If it is cut off below: deny, then /signet show {draft.code}")
+    lines.extend(head)
+    lines.extend(text)
     lines.append(f"Seal {draft.code} covers exactly this message ({len(draft.body):,} characters). Any change needs a new seal.")
     return "\n".join(lines)
 

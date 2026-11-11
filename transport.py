@@ -20,12 +20,13 @@ import ssl
 import subprocess
 from dataclasses import dataclass
 from email import policy
+from email.headerregistry import Address
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from .core import Draft, DraftError
+from .core import Draft, DraftError, split_mailbox
 
 TRANSPORTS = ("outbox", "command", "smtp")
 DEFAULT_COMMAND = ["himalaya", "message", "send"]
@@ -45,20 +46,32 @@ class TransportError(RuntimeError):
     """The transport is not usable as configured. Nothing was sent."""
 
 
+def _mailbox(formatted: str) -> Address:
+    """A header address made of the name and address the card showed, encoded by the mail policy."""
+    name, address = split_mailbox(formatted)
+    return Address(display_name=name, addr_spec=address)
+
+
+def _seconds(settings: dict[str, Any]) -> float:
+    try:
+        return min(600.0, max(5.0, float(settings.get("send_timeout") or 60)))
+    except (TypeError, ValueError):
+        return 60.0
+
+
 def build_message(draft: Draft, *, seal_header: bool = False) -> EmailMessage:
     """The RFC 5322 message of a draft. Only the draft's fields go in: there is no pass-through."""
     message = EmailMessage(policy=policy.SMTP)
-    message["From"] = draft.sender
-    message["To"] = ", ".join(draft.to)
+    message["From"] = _mailbox(draft.sender)
+    message["To"] = [_mailbox(value) for value in draft.to]
     if draft.cc:
-        message["Cc"] = ", ".join(draft.cc)
+        message["Cc"] = [_mailbox(value) for value in draft.cc]
     message["Subject"] = draft.subject
     message["Date"] = formatdate(usegmt=True)
     message["Message-ID"] = make_msgid(domain=draft.sender_address.rpartition("@")[2] or None)
     if draft.in_reply_to:
         message["In-Reply-To"] = draft.in_reply_to
-    if draft.references or draft.in_reply_to:
-        message["References"] = draft.references or draft.in_reply_to
+        message["References"] = draft.in_reply_to
     if seal_header:
         message["X-Signet-Seal"] = draft.digest
     message.set_content(draft.body + "\n", charset="utf-8")
@@ -89,7 +102,7 @@ def _command(settings: dict[str, Any]) -> list[str]:
 
 def _send_command(message: EmailMessage, settings: dict[str, Any]) -> str:
     argv = _command(settings)
-    timeout = float(settings.get("send_timeout") or 60)
+    timeout = _seconds(settings)
     try:
         done = subprocess.run(  # noqa: S603 - a fixed word list from the settings, never a shell line
             argv, input=message.as_bytes(policy=policy.SMTP), capture_output=True, timeout=timeout, check=False,
@@ -112,12 +125,15 @@ def _send_smtp(message: EmailMessage, draft: Draft, settings: dict[str, Any],
         raise TransportError("smtp_security must be starttls, ssl or none")
     if security == "none" and host not in _LOCAL_HOSTS:
         raise TransportError("smtp_security: none is accepted for a server on this machine only")
-    port = int(settings.get("smtp_port") or (465 if security == "ssl" else 587))
+    try:
+        port = int(settings.get("smtp_port") or (465 if security == "ssl" else 587))
+    except (TypeError, ValueError) as exc:
+        raise TransportError("smtp_port must be a number") from exc
     username = str(settings.get("smtp_username") or "").strip()
     password = secret("SIGNET_SMTP_PASSWORD") if username else None
     if username and not password:
         raise TransportError("smtp_username is set but the secret SIGNET_SMTP_PASSWORD is not")
-    timeout = float(settings.get("send_timeout") or 60)
+    timeout = _seconds(settings)
     context = ssl.create_default_context()
     if security == "ssl":
         server: smtplib.SMTP = smtplib.SMTP_SSL(host, port, timeout=timeout, context=context)
@@ -128,7 +144,7 @@ def _send_smtp(message: EmailMessage, draft: Draft, settings: dict[str, Any],
             server.starttls(context=context)
         if username:
             server.login(username, password or "")
-        server.send_message(message, from_addr=draft.sender_address, to_addrs=draft.recipient_addresses)
+        server.send_message(message, from_addr=split_mailbox(draft.sender)[1], to_addrs=draft.envelope_recipients)
     return f"accepted by {host}"
 
 
@@ -139,7 +155,7 @@ def deliver(draft: Draft, settings: dict[str, Any], *, save: Callable[[Draft, by
     if transport not in TRANSPORTS:
         return Delivery(False, transport, f"unknown transport “{transport}”; use outbox, command or smtp")
     try:
-        message = build_message(draft, seal_header=bool(settings.get("seal_header")))
+        message = build_message(draft, seal_header=settings.get("seal_header") is True)
         message_id = str(message["Message-ID"])
         if transport == "outbox":
             path = save(draft, message.as_bytes(policy=policy.SMTP))

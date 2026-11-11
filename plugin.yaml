@@ -2,7 +2,7 @@ name: signet
 version: 0.1.0
 manifest_version: 2
 api_version: 1
-description: "An email leaves your agent only with your seal on that exact message. Signet shows you the real sender, recipients, subject, body and attachments in Hermes's own approval prompt, ties your yes to their SHA-256, and sends nothing else. YOLO mode, approvals off and scheduled runs cannot seal: those emails wait for /signet send. Direct mailers are blocked."
+description: "An email leaves your agent only with your seal on that exact message. Signet shows you the real recipients, sender, subject, text and attachments in Hermes's own approval prompt, ties your yes to their SHA-256, and sends nothing else. YOLO mode, approvals off and scheduled runs cannot seal: those emails wait for /signet send. Direct mailers are blocked."
 author: Signet contributors
 license: MIT
 homepage: https://github.com/Wecko-ai/hermes-signet

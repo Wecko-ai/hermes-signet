@@ -21,6 +21,10 @@ HUMAN_CHOICES = frozenset({"once", "session", "always"})
 _PRESENTED_TTL = 24 * 3600
 _SEAL_TTL = 300
 _MAX_TRACKED = 500
+DENIED_KEPT = 24 * 3600
+MAX_HELD = 200
+_SHOWN_TTL = 3600
+_LEDGER_TAIL = 5000
 _FILES = threading.Lock()  # one lock for the files of every profile served by this process
 
 
@@ -31,6 +35,7 @@ class Seals:
         self._lock = threading.Lock()
         self._presented: dict[str, tuple[str, float]] = {}  # rule key -> (digest, shown at)
         self._sealed: dict[str, dict[str, Any]] = {}         # digest -> seal
+        self._shown: dict[str, float] = {}                   # digest -> shown in full at
 
     def present(self, digest: str) -> str:
         """Register that ``digest`` is about to be shown, and return the rule key of that showing.
@@ -69,12 +74,23 @@ class Seals:
         with self._lock:
             self._sealed[digest] = {"at": time.time(), "by": by, "surface": surface}
 
+    def mark_shown(self, digest: str) -> None:
+        """A trusted surface has just displayed this draft in full to a person."""
+        with self._lock:
+            self._shown[digest] = time.time()
+
+    def was_shown(self, digest: str) -> bool:
+        with self._lock:
+            at = self._shown.get(digest)
+        return at is not None and time.time() - at <= _SHOWN_TTL
+
     def forget(self, digest: str) -> None:
         """Void every open showing and unused seal of ``digest``: a prompt answered later seals nothing."""
         with self._lock:
             for key in [key for key, (shown, _) in self._presented.items() if shown == digest]:
                 del self._presented[key]
             self._sealed.pop(digest, None)
+            self._shown.pop(digest, None)
 
     def consume(self, digest: str) -> Optional[dict[str, Any]]:
         """Take the seal of ``digest``. A seal is spent by the first send that uses it."""
@@ -92,6 +108,8 @@ class Seals:
             del self._presented[next(iter(self._presented))]
         for key in [key for key, seal in self._sealed.items() if now - seal["at"] > _SEAL_TTL]:
             del self._sealed[key]
+        for key in [key for key, at in self._shown.items() if now - at > _SHOWN_TTL]:
+            del self._shown[key]
 
 
 def _rule_key(pattern_key: str) -> str:
@@ -138,12 +156,14 @@ class Outbox:
         }
         path = self._pending_path(draft.code)
         with self._lock:
-            if path.exists():
-                try:
-                    record["held_at"] = json.loads(path.read_text(encoding="utf-8")).get("held_at", record["held_at"])
-                except (OSError, ValueError):
-                    pass
+            try:
+                earlier = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(earlier, dict) and earlier.get("digest") == draft.digest:
+                    record["held_at"] = float(earlier.get("held_at") or record["held_at"])
+            except Exception:  # noqa: BLE001 - no file yet, or one that is not ours: start afresh
+                pass
             _write_private(path, json.dumps(record, ensure_ascii=False, indent=1))
+            self._trim()
 
     def load(self, code: str) -> Optional[tuple[Draft, dict[str, Any]]]:
         """The held draft with this code, checked against its own fingerprint."""
@@ -154,12 +174,21 @@ class Outbox:
         try:
             record = json.loads(path.read_text(encoding="utf-8"))
             draft = draft_from_record(record["draft"])
-        except (OSError, ValueError, KeyError, TypeError):
-            return None
-        # A file edited after it was written no longer matches its name: treat it as absent.
-        if draft.code != code or draft.digest != record.get("digest"):
+            # A file edited after it was written no longer matches its name: treat it as absent.
+            if draft.code != code or draft.digest != record.get("digest"):
+                return None
+        except Exception:  # noqa: BLE001 - a damaged or foreign file is simply not a held draft
             return None
         return draft, record
+
+    def _trim(self) -> None:
+        """Keep the newest MAX_HELD drafts: an agent in a loop must not fill the disk."""
+        files = sorted(self._dir("pending").glob("*.json"), key=lambda item: item.stat().st_mtime)
+        for path in files[:-MAX_HELD] if len(files) > MAX_HELD else ():
+            try:
+                path.unlink()
+            except OSError:
+                pass
 
     def release(self, code: str) -> None:
         code = normalize_code(code)
@@ -171,11 +200,18 @@ class Outbox:
                     pass
 
     def pending(self) -> list[tuple[Draft, dict[str, Any]]]:
+        """Every held draft, oldest first. A draft the person denied is kept one day, then removed."""
         items = []
+        now = time.time()
         for path in sorted(self._dir("pending").glob("*.json")):
             loaded = self.load(path.stem)
-            if loaded:
-                items.append(loaded)
+            if not loaded:
+                continue
+            record = loaded[1]
+            if record.get("state") == "denied" and now - float(record.get("denied_at") or 0) > DENIED_KEPT:
+                self.release(path.stem)
+                continue
+            items.append(loaded)
         items.sort(key=lambda item: item[1].get("held_at", 0))
         return items
 
@@ -207,7 +243,7 @@ class Outbox:
         except OSError:
             return []
         entries = []
-        for line in lines[-limit:] if limit else lines:
+        for line in lines[-(limit or _LEDGER_TAIL):]:
             try:
                 entry = json.loads(line)
             except ValueError:

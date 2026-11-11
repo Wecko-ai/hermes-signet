@@ -13,15 +13,19 @@ what the agent called, and what left.
 
 ## In scope
 
-- An email sent by `signet_send_mail` or `/signet send` whose content differs from what was shown.
+- An email sent by `signet_send_mail` or `/signet send` that a mail client displays differently
+  from what the card showed: another recipient, name, subject, text or attachment.
 - A seal obtained without a person answering Hermes's approval prompt or typing `/signet send`.
-- A held draft changed on disk and then sent.
+- A held draft that `/signet send` sends without having shown it in full, or after it changed.
 - A credential file accepted as an attachment.
+- A tool call, of any size or shape, that makes Signet's hook hang or fail for tools other than
+  its own.
 
 ## Known limits, not bugs
 
 - Signet is a set of hooks inside Hermes, not a sandbox. An agent with a shell that deliberately
-  writes its own mailer, or edits the plugin, is outside what hooks can stop. The README says how to
-  contain that case.
-- The guard recognises a list of well-known mailers and mail APIs. A mailer missing from the list is
-  worth an issue or a pull request, not a private report.
+  writes its own mailer, hides a command from the guard, or edits the plugin, is outside what hooks
+  can stop. The README says how to contain that case.
+- The guard recognises a list of well-known mailers, libraries and mail APIs. A mailer missing from
+  the list is worth an issue or a pull request, not a private report.
+- `trusted_recipients` sends without a prompt by design, to the addresses the owner listed.

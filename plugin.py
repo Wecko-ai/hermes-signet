@@ -21,7 +21,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 from . import guard
-from .core import Draft, DraftError, build_draft, format_code, normalize_code, one_line, render_card, risk_notes, verify_attachments
+from .core import (Draft, DraftError, build_draft, format_code, normalize_code, one_line, record_to_args,
+                   render_card, risk_notes, split_mailbox, verify_attachments)
 from .schemas import SEND_TOOL
 from .store import RULE_PREFIX, Outbox, Seals
 from .transport import DEFAULT_COMMAND, TRANSPORTS, deliver
@@ -63,11 +64,12 @@ _HELD = (
     "this email and do not try another way to send it."
 )
 _NOT_ASKED = "nobody could be asked to approve it (no approval prompt was available)"
+_MASKED = "⚠ Hermes masks secret-looking text on this card (***); the real text is what is sent"
 _USAGE = (
     "Signet commands:\n"
     "  /signet                 status and the emails waiting for you\n"
     "  /signet show CODE       read a held email in full\n"
-    "  /signet send CODE       seal and send a held email\n"
+    "  /signet send CODE       seal and send a held email (it is shown in full first)\n"
     "  /signet drop CODE       discard a held email\n"
     "  /signet log [N]         the last N ledger entries (default 10)"
 )
@@ -88,8 +90,33 @@ class Signet:
             value = default
         return default if value is None else value
 
+    def _number(self, key: str, low: int, high: int) -> int:
+        try:
+            return min(high, max(low, int(self.setting(key))))
+        except (TypeError, ValueError):
+            return int(DEFAULTS[key])
+
+    def _choice(self, key: str, allowed: tuple[str, ...]) -> str:
+        value = self.setting(key)
+        if value is False:  # YAML reads a bare `off` as false
+            value = "off"
+        text = str(value).strip().lower()
+        return text if text in allowed else str(DEFAULTS[key])
+
+    def _address_set(self, key: str) -> set[str]:
+        value = self.setting(key)
+        items = [value] if isinstance(value, str) else (value if isinstance(value, (list, tuple)) else [])
+        found = set()
+        for item in items:
+            address = split_mailbox(str(item).strip())[1].strip().lower()
+            if address:
+                found.add(address)
+        return found
+
     def settings(self) -> dict[str, Any]:
-        return {key: self.setting(key) for key in DEFAULTS}
+        values = {key: self.setting(key) for key in DEFAULTS}
+        values["seal_header"] = values["seal_header"] is True or str(values["seal_header"]).strip().lower() in ("true", "yes", "on", "1")
+        return values
 
     def outbox(self) -> Outbox:
         if self._data_dir is not None:
@@ -121,67 +148,81 @@ class Signet:
             return None
 
     @staticmethod
-    def _addresses(value: Any) -> set[str]:
-        items = [value] if isinstance(value, str) else (value if isinstance(value, (list, tuple)) else [])
-        return {str(item).strip().lower() for item in items if str(item).strip()}
+    def _masked_by_hermes(text: str) -> bool:
+        """True when Hermes's own redaction would alter this text on an approval surface."""
+        try:
+            from agent.redact import redact_sensitive_text
+            return redact_sensitive_text(text, force=True) != text
+        except Exception:  # noqa: BLE001
+            return False
 
     def build(self, args: Any) -> Draft:
         draft = build_draft(
             args if isinstance(args, dict) else {},
             default_from=str(self.setting("from_address") or ""),
             base_dir=self._base_dir(),
-            max_recipients=int(self.setting("max_recipients") or DEFAULTS["max_recipients"]),
+            max_recipients=self._number("max_recipients", 1, 500),
         )
-        allowed = self._addresses(self.setting("allowed_from"))
+        allowed = self._address_set("allowed_from")
         if allowed and draft.sender_address not in allowed:
             raise DraftError(f"the sender {draft.sender_address} is not in allowed_from")
         return draft
 
     def needs_no_seal(self, draft: Draft) -> bool:
         """True when every recipient is an address the owner listed as needing no seal."""
-        trusted = self._addresses(self.setting("trusted_recipients"))
+        trusted = self._address_set("trusted_recipients")
         return bool(trusted) and all(address in trusted for address in draft.recipient_addresses)
 
     def card(self, draft: Draft, outbox: Outbox, *, full: bool = False, title: str = "") -> str:
         notes = risk_notes(draft, known_addresses=outbox.known_addresses())
-        preview = 0 if full else int(self.setting("preview_chars") or DEFAULTS["preview_chars"])
+        if not full and self._masked_by_hermes(draft.subject + "\n" + draft.body):
+            notes.insert(0, _MASKED)
+        preview = 0 if full else self._number("preview_chars", 200, 20000)
         return render_card(draft, notes, preview_chars=preview, title=title)
 
     # --- hooks -------------------------------------------------------------------------------------
     def pre_tool_call(self, tool_name: str = "", args: Any = None, task_id: str = "", **kwargs: Any) -> Optional[dict[str, Any]]:
         if tool_name == SEND_TOOL:
-            # An error here blocks the send (Hermes fails closed on a raising hook): that is intended.
             return self._gate(args)
         try:
             label = guard.detect(tool_name, args)
+            return self._guard(label, tool_name) if label else None
         except Exception:  # noqa: BLE001 - the guard must never break unrelated tool calls
             logger.exception("signet: guard failed on %s", tool_name)
             return None
-        return self._guard(label, tool_name) if label else None
 
     def _gate(self, args: Any) -> Optional[dict[str, Any]]:
+        """Ask for a person's approval of the draft these arguments make.
+
+        Returning ``None`` never lets mail out: the handler sends only with a seal, and a seal comes
+        only from an answered prompt. So when the draft is refused, or anything here fails, there is
+        simply no prompt, and the handler reports what is wrong.
+        """
         try:
             draft = self.build(args)
+            if self.needs_no_seal(draft) or self.in_cron():
+                return None  # the handler sends (trusted recipients) or holds (nobody to ask)
+            outbox = self.outbox()
+            # Held before Hermes decides anything: if no prompt can be shown (no person, no gateway),
+            # the draft is not lost. pre_approval_request corrects the reason once a person is asked.
+            outbox.hold(draft, _NOT_ASKED)
+            return {
+                "action": "approve",
+                "message": self.card(draft, outbox),
+                "rule_key": self.seals.present(draft.digest),
+            }
         except DraftError:
-            return None  # nothing to approve: the handler tells the model what is wrong
-        if self.needs_no_seal(draft) or self.in_cron():
-            return None  # no prompt: the handler sends (trusted recipients) or holds (nobody to ask)
-        outbox = self.outbox()
-        # Held before Hermes decides anything: if no prompt can be shown (no person, no gateway),
-        # the draft is not lost. pre_approval_request corrects the reason once a person is asked.
-        outbox.hold(draft, _NOT_ASKED)
-        return {
-            "action": "approve",
-            "message": self.card(draft, outbox),
-            "rule_key": self.seals.present(draft.digest),
-        }
+            return None
+        except Exception:  # noqa: BLE001
+            logger.exception("signet: could not prepare the approval prompt")
+            return None
 
     def _guard(self, label: str, tool_name: str) -> Optional[dict[str, Any]]:
         cron = self.in_cron()
-        mode = str(self.setting("cron_guard" if cron else "guard")).lower()
+        mode = self._choice("cron_guard", ("block", "allow")) if cron else self._choice("guard", ("block", "approve", "off"))
         if mode in ("off", "allow"):
             return None
-        if mode == "approve" and not cron:
+        if mode == "approve":
             return {"action": "approve", "message": _GUARD_APPROVE.format(label=label), "rule_key": f"signet-guard:{label}"}
         try:
             self.outbox().record("blocked", mailer=label, tool=tool_name, scheduled=cron or None)
@@ -194,9 +235,10 @@ class Signet:
         if RULE_PREFIX not in (pattern_key or ""):
             return
         digest = self.seals.digest_for(pattern_key)
-        loaded = self.outbox().load(format_code(digest)) if digest else None
-        if loaded is not None:
-            self.outbox().hold(loaded[0], "waiting for your answer to the approval prompt", state="awaiting")
+        outbox = self.outbox()
+        loaded = outbox.load(format_code(digest)) if digest else None
+        if loaded is not None and loaded[0].digest == digest:
+            outbox.hold(loaded[0], "waiting for your answer to the approval prompt", state="awaiting")
 
     def post_approval_response(self, pattern_key: str = "", choice: str = "", surface: str = "", **kwargs: Any) -> None:
         if RULE_PREFIX not in (pattern_key or ""):
@@ -206,11 +248,13 @@ class Signet:
             return
         outbox = self.outbox()
         loaded = outbox.load(format_code(digest))
-        if loaded is None:
+        if loaded is None or loaded[0].digest != digest:
             return
         draft = loaded[0]
         if choice == "deny":
-            outbox.release(draft.code)
+            # Not sent. Kept one day: a narrow prompt may have shown only the start of the message,
+            # and the person can still read it all (/signet show) and send it themselves.
+            outbox.hold(draft, "you denied it at the prompt", state="denied", denied_at=time.time())
             outbox.record("denied", draft, surface=surface)
             return
         reason = {
@@ -225,6 +269,7 @@ class Signet:
     def send_mail(self, args: Any, **kwargs: Any) -> str:
         try:
             draft = self.build(args)
+            code = draft.code
         except DraftError as exc:
             return _json({"sent": False, "status": "refused", "error": f"Signet refused this draft: {exc}."})
         except Exception as exc:  # noqa: BLE001
@@ -243,33 +288,50 @@ class Signet:
                 )
                 outbox.hold(draft, reason)
                 outbox.record("held", draft, reason=reason)
-                return _json({"sent": False, "status": "held", "code": draft.code,
-                              "message": _HELD.format(code=draft.code, reason=reason)})
+                return _json({"sent": False, "status": "held", "code": code,
+                              "message": _HELD.format(code=code, reason=reason)})
             return _json(self._deliver(draft, seal, outbox))
         except Exception as exc:  # noqa: BLE001
             logger.exception("signet: send failed")
-            return _json({"sent": False, "status": "error", "code": draft.code,
-                          "error": f"Signet failed before sending: {exc}. Do not retry; tell the user."})
+            return _json({"sent": False, "status": "error", "code": code,
+                          "error": f"Signet stopped before handing the email to the transport: {exc}. Do not retry; tell the user."})
 
     def _deliver(self, draft: Draft, seal: dict[str, Any], outbox: Outbox) -> dict[str, Any]:
         delivery = deliver(draft, self.settings(), save=outbox.save_message, secret=self._secret)
         common = {"code": draft.code, "to": draft.recipient_addresses, "subject": draft.subject,
                   "transport": delivery.transport, "detail": delivery.detail}
         if not delivery.ok:
-            outbox.hold(draft, delivery.detail, state="failed")
-            outbox.record("failed", draft, sealed_by=seal.get("by"), transport=delivery.transport, detail=delivery.detail)
+            self._bookkeeping(lambda: outbox.hold(draft, delivery.detail, state="failed"),
+                              lambda: outbox.record("failed", draft, sealed_by=seal.get("by"),
+                                                    transport=delivery.transport, detail=delivery.detail))
             return {"sent": False, "status": "failed", **common,
                     "message": "The email was not confirmed as sent. Do not retry: a second attempt may deliver it twice. "
                                f"Tell the user what happened; they can retry with /signet send {draft.code}."}
-        outbox.release(draft.code)
-        outbox.record("sent", draft, sealed_by=seal.get("by"), surface=seal.get("surface"),
-                      transport=delivery.transport, message_id=delivery.message_id, delivered=delivery.delivered)
+        # The email has left (or was written): whatever happens to the records now, say so.
+        complete = self._bookkeeping(
+            lambda: outbox.release(draft.code),
+            lambda: outbox.record("sent", draft, sealed_by=seal.get("by"), surface=seal.get("surface"),
+                                  transport=delivery.transport, message_id=delivery.message_id,
+                                  delivered=delivery.delivered))
         result = {"sent": delivery.delivered, "status": "sent" if delivery.delivered else "written", **common,
                   "message_id": delivery.message_id, "sealed_by": seal.get("by")}
         if not delivery.delivered:
             result["message"] = ("Signet's transport is 'outbox': the approved message was written to a file and not "
                                  "delivered. Tell the user to set a transport in the plugin settings.")
+        if not complete:
+            result["warning"] = "The email went out, but Signet could not update its ledger or outbox. Do not send it again."
         return result
+
+    @staticmethod
+    def _bookkeeping(*steps: Any) -> bool:
+        complete = True
+        for step in steps:
+            try:
+                step()
+            except Exception:  # noqa: BLE001 - a record that cannot be written must not change what is reported
+                logger.exception("signet: could not update the outbox or the ledger")
+                complete = False
+        return complete
 
     def outbox_tool(self, args: Any, **kwargs: Any) -> str:
         try:
@@ -282,7 +344,7 @@ class Signet:
                      "state": record.get("state"), "reason": record.get("reason"),
                      "held_minutes": int(max(0, time.time() - float(record.get("held_at") or 0)) // 60)}
                     for draft, record in outbox.pending()]
-            return _json({"held": held, "recent": outbox.entries(limit), "transport": self.setting("transport")})
+            return _json({"held": held, "recent": outbox.entries(limit), "transport": self._choice("transport", TRANSPORTS)})
         except Exception as exc:  # noqa: BLE001
             logger.exception("signet: outbox read failed")
             return _json({"error": f"Signet could not read its outbox: {exc}"})
@@ -298,7 +360,7 @@ class Signet:
             if verb == "log":
                 return self._log(argument)
             if verb in ("show", "send", "drop"):
-                return self._on_held(verb, argument, platform)
+                return self._on_held(verb, argument, str(platform or ""))
         except Exception as exc:  # noqa: BLE001
             logger.exception("signet: /signet %s failed", verb)
             return f"Signet: /signet {verb} failed: {exc}"
@@ -306,27 +368,36 @@ class Signet:
 
     def _status(self) -> str:
         outbox = self.outbox()
-        transport = str(self.setting("transport")).lower()
+        raw_transport = str(self.setting("transport")).strip().lower()
+        command = self.setting("send_command")
+        shown_command = " ".join(map(str, command)) if isinstance(command, (list, tuple)) else f"{command!r} (must be a list of words)"
         about = {
             "outbox": "outbox (approved emails are written as .eml files, nothing is delivered)",
-            "command": "command (" + " ".join(map(str, self.setting("send_command") or [])) + ")",
+            "command": f"command ({shown_command})",
             "smtp": f"smtp ({self.setting('smtp_host') or 'smtp_host is not set'})",
-        }.get(transport, f"{transport} (unknown: use one of {', '.join(TRANSPORTS)})")
+        }.get(raw_transport, f"{raw_transport} (unknown: use one of {', '.join(TRANSPORTS)})")
         lines = [f"Signet. Transport: {about}.",
-                 f"Guard on direct mailers: {self.setting('guard')}; in scheduled runs: {self.setting('cron_guard')}."]
+                 f"Guard on direct mailers: {self._choice('guard', ('block', 'approve', 'off'))}; "
+                 f"in scheduled runs: {self._choice('cron_guard', ('block', 'allow'))}."]
         sender = str(self.setting("from_address") or "")
         lines.append(f"Default sender: {sender}." if sender else "Default sender: not set (the agent must give one).")
-        held = outbox.pending()
+        everything = outbox.pending()
+        held = [item for item in everything if item[1].get("state") != "denied"]
+        denied = [item for item in everything if item[1].get("state") == "denied"]
         if held:
             lines += ["", f"{len(held)} email(s) waiting for you:"]
             lines += [f"  {one_line(draft)}  ({record.get('reason') or record.get('state')})" for draft, record in held]
-            lines += ["", "/signet show CODE to read one, /signet send CODE to seal and send it, /signet drop CODE to discard it."]
         else:
             lines += ["", "No email is waiting for you."]
+        if denied:
+            lines += ["", "Denied in the last day (not sent, kept in case you want to read or send them):"]
+            lines += [f"  {one_line(draft)}" for draft, _ in denied]
+        if held or denied:
+            lines += ["", "/signet show CODE to read one, /signet send CODE to seal and send it, /signet drop CODE to discard it."]
         sent = [entry for entry in outbox.entries() if entry.get("event") == "sent"][-3:]
         if sent:
             lines += ["", "Last sent:"]
-            lines += [f"  {entry.get('at')}  {entry.get('code')}  to {', '.join(entry.get('to') or [])}  “{entry.get('subject') or ''}”"
+            lines += [f"  {entry.get('at')}  {entry.get('code')}  to {_joined(entry.get('to'))}  “{entry.get('subject') or ''}”"
                       for entry in sent]
         return "\n".join(lines)
 
@@ -341,10 +412,10 @@ class Signet:
         lines = []
         for entry in entries:
             what = entry.get("code") or entry.get("mailer") or ""
-            who = ", ".join(entry.get("to") or [])
             extra = entry.get("sealed_by") or entry.get("reason") or entry.get("detail") or entry.get("tool") or ""
-            lines.append("  ".join(part for part in (str(entry.get("at")), f"{entry.get('event'):<8}", str(what), who,
-                                                     f"“{entry['subject']}”" if entry.get("subject") else "", str(extra)) if part))
+            subject = f"“{entry.get('subject')}”" if entry.get("subject") else ""
+            parts = (str(entry.get("at") or ""), f"{str(entry.get('event') or '?'):<8}", str(what), _joined(entry.get("to")), subject, str(extra))
+            lines.append("  ".join(part for part in parts if part))
         return "\n".join(lines)
 
     def _on_held(self, verb: str, argument: str, platform: str) -> str:
@@ -356,13 +427,12 @@ class Signet:
         if loaded is None:
             return f"No held email has the code {code}. /signet lists what is waiting."
         draft, record = loaded
+        status = record.get("reason") or record.get("state") or ""
         if verb == "show":
-            status = record.get("reason") or record.get("state") or ""
-            return self.card(draft, outbox, full=True, title=f"Held email {code} ({status})")
-        # The person is deciding here: a prompt still open for this draft must not send it a second time.
-        if verb in ("drop", "send"):
-            self.seals.forget(draft.digest)
+            self.seals.mark_shown(draft.digest)
+            return self.card(draft, outbox, full=True, title=f"Held email {code} ({status})") + f"\n\n/signet send {code} seals and sends it; /signet drop {code} discards it."
         if verb == "drop":
+            self.seals.forget(draft.digest)  # a prompt still open for this draft seals nothing now
             outbox.release(code)
             outbox.record("dropped", draft, surface=platform)
             return f"Dropped {one_line(draft)}. Nothing was sent."
@@ -370,17 +440,33 @@ class Signet:
             return "Signet: a scheduled run cannot seal an email."
         try:
             verify_attachments(draft)
+            # A held file is data on disk: it passes the same checks as a fresh draft (sender rules,
+            # limits, cleaning) and must come out as the very same message, or it is not sent.
+            if self.build(record_to_args(draft.to_record())).digest != draft.digest:
+                raise DraftError("the held file is not a draft Signet would have written")
         except DraftError as exc:
             return f"Not sent: {exc}. Ask the agent to prepare the email again."
-        # Typing the command is the person's seal on this exact fingerprint.
+        if not self.seals.was_shown(draft.digest):
+            # A seal covers what its owner has read. Whatever this code points at, show it first.
+            self.seals.mark_shown(draft.digest)
+            return (self.card(draft, outbox, full=True, title=f"Held email {code} ({status}): this is what would be sent")
+                    + f"\n\nNothing was sent yet. If this is right, run /signet send {code} again to seal and send it.")
+        # Typing the command a second time, after reading it, is the person's seal on this fingerprint.
+        self.seals.forget(draft.digest)  # a prompt still open for this draft must not send it twice
         self.seals.seal(draft.digest, by="command:/signet send", surface=platform)
-        seal = self.seals.consume(draft.digest) or {}
+        seal = self.seals.consume(draft.digest)
+        if seal is None:
+            return f"Not sent: another send of {code} is under way."
         result = self._deliver(draft, seal, outbox)
         if result["status"] == "sent":
             return f"Sent {one_line(draft)} ({result['detail']})."
         if result["status"] == "written":
             return f"Sealed {one_line(draft)}. {result['detail']}. Set a transport in the plugin settings to deliver for real."
         return f"Not sent: {result['detail']}. The email is still held as {code}."
+
+
+def _joined(value: Any) -> str:
+    return ", ".join(str(item) for item in value) if isinstance(value, (list, tuple)) else ""
 
 
 def _json(value: dict[str, Any]) -> str:

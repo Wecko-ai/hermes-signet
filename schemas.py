@@ -37,10 +37,6 @@ SEND_MAIL = {
                 "type": "string",
                 "description": "Message-ID of the mail this one answers, like <id@host>. Optional.",
             },
-            "references": {
-                "type": "string",
-                "description": "Message-IDs of the thread, separated by spaces. Optional.",
-            },
             "attachments": {
                 "type": "array",
                 "items": {"type": "string"},

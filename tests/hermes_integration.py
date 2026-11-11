@@ -168,7 +168,9 @@ def _worker(name: str) -> dict:
         check.ok(not _emls(home), "an .eml was written after a deny")
         events = [e.get("event") for e in _ledger(home)]
         check.ok("denied" in events and "sent" not in events, f"ledger events {events}")
-        check.ok(not _pending(home), f"pending/ not empty after deny: {[p.name for p in _pending(home)]}")
+        kept = [json.loads(p.read_text(encoding="utf-8")) for p in _pending(home)]
+        check.ok(len(kept) == 1 and kept[0].get("state") == "denied",
+                 f"a denied draft should be kept as 'denied' for the person: {[k.get('state') for k in kept]}")
         summary = f"result={raw[:160]!r} ledger={events}"
 
     elif name in ("C", "D"):
@@ -181,6 +183,10 @@ def _worker(name: str) -> dict:
         pend = _pending(home)
         check.ok(len(pend) == 1, f"{len(pend)} files in pending/, expected 1")
         code = result.get("code", "")
+        # The first /signet send reads the email back in full and sends nothing; the second one seals it.
+        first = slash(f"send {code}")
+        check.ok("Nothing was sent yet" in first and MAIL["subject"] in first and not _emls(home),
+                 f"the first /signet send should only show the email: {first[:200]!r}")
         out = slash(f"send {code}")
         emls = _emls(home)
         check.ok(len(emls) == 1 and mail_matches(emls[0]), f"after /signet send: {len(emls)} .eml ({out[:200]!r})")
@@ -263,9 +269,9 @@ PLAN = {  # scenario -> (approvals.mode, extra environment)
 }
 TITLES = {
     "A": "person answers once -> written, one .eml, ledger sent/approval:once",
-    "B": "person answers deny -> BLOCKED, no .eml, ledger denied",
-    "C": "YOLO -> held (not sent); /signet send CODE -> .eml, sealed_by command",
-    "D": "approvals.mode off -> held (not sent); /signet send CODE -> .eml",
+    "B": "person answers deny -> BLOCKED, no .eml, ledger denied, draft kept as denied",
+    "C": "YOLO -> held (not sent); /signet send CODE shows it, the second one sends, sealed_by command",
+    "D": "approvals.mode off -> held (not sent); /signet send CODE twice -> .eml",
     "E": "guard blocks himalaya send in terminal, lets ls -la through",
     "F": "no interactive user / gateway / cron -> Hermes fails closed, nothing sent, draft held",
     "G": "an 'always allow' answer covers one showing: the next send is asked about again",

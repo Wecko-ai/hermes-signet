@@ -83,12 +83,29 @@ class Sealing(Harness):
         self.assertEqual(result["status"], "held")
         self.assertEqual(self.eml(), [])
 
-    def test_a_no_sends_nothing_and_keeps_nothing(self):
+    def test_a_no_sends_nothing(self):
         directive, result = self.call(MAIL, answer="deny")
         self.assertIsNone(result)
         self.assertEqual(self.eml(), [])
-        self.assertEqual(self.held(), [])
         self.assertEqual(self.events(), ["denied"])
+        # Even if the handler ran, a denied draft has no seal.
+        self.assertEqual(json.loads(self.signet.send_mail(MAIL))["status"], "held")
+        self.assertEqual(self.eml(), [])
+
+    def test_a_denied_email_is_kept_one_day_for_the_person_only(self):
+        self.call(MAIL, answer="deny")
+        code = self.signet.build(MAIL).code
+        status = self.signet.command("")
+        self.assertIn("No email is waiting", status)
+        self.assertIn("Denied in the last day", status)
+        self.assertIn(code, status)
+        self.assertIn("figures attached.", self.signet.command(f"show {code}"))
+        path = self.data / "pending" / f"{code}.json"
+        record = json.loads(path.read_text())
+        record["denied_at"] -= 25 * 3600
+        path.write_text(json.dumps(record))
+        self.assertNotIn(code, self.signet.command(""))
+        self.assertFalse(path.exists())
 
     def test_silence_is_not_a_yes(self):
         for answer in ("timeout", "cancelled", "notify_failed", "smart_approve"):
@@ -175,6 +192,62 @@ class Policies(Harness):
         self.assertEqual(result["status"], "written")
 
 
+class Settings(Harness):
+    def test_nonsense_settings_fall_back_instead_of_breaking_the_gate(self):
+        self.ctx.settings.update(max_recipients="abc", preview_chars=[1], send_timeout="soon", send_command=5,
+                                 smtp_port="x", allowed_from=7, trusted_recipients={"a": 1}, seal_header="false")
+        directive, result = self.call(MAIL)
+        self.assertEqual(directive["action"], "approve")
+        self.assertEqual(result["status"], "written")
+        self.assertNotIn("X-Signet-Seal", self.eml()[0].read_text())
+        self.assertIn("Transport: outbox", self.signet.command(""))
+        self.ctx.settings["transport"] = "command"
+        self.assertIn("must be a list of words", self.signet.command(""))
+        self.ctx.settings.update(transport="smtp", smtp_host="127.0.0.1", smtp_security="none")
+        _, result = self.call({**MAIL, "subject": "again"})
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("smtp_port must be a number", result["detail"])
+
+    def test_yaml_off_switches_the_guard_off(self):
+        self.ctx.settings["guard"] = False
+        self.assertIsNone(self.signet.pre_tool_call(tool_name="terminal", args={"command": "msmtp -t < m"}))
+        self.ctx.settings["guard"] = "nonsense"
+        self.assertEqual(self.signet.pre_tool_call(tool_name="terminal", args={"command": "msmtp -t < m"})["action"], "block")
+
+    def test_trusted_and_allowed_lists_accept_names_around_addresses(self):
+        self.ctx.settings.update(trusted_recipients=["Bob <BOB@example.com>"], allowed_from="Ada <ada@example.org>")
+        directive, result = self.call(MAIL)
+        self.assertIsNone(directive)
+        self.assertEqual(result["sealed_by"], "policy:trusted_recipients")
+
+    def test_a_ledger_that_cannot_be_written_does_not_hide_a_send(self):
+        self.data.mkdir(exist_ok=True)
+        (self.data / "ledger.jsonl").mkdir()  # a folder where the ledger file should be
+        directive = self.signet.pre_tool_call(tool_name=schemas.SEND_TOOL, args=MAIL)
+        self.signet.post_approval_response(pattern_key=f"plugin_rule:{directive['rule_key']}", choice="once")
+        with self.assertLogs(plugin.logger, level="ERROR"):
+            result = json.loads(self.signet.send_mail(MAIL))
+        self.assertEqual(result["status"], "written")
+        self.assertIn("Do not send it again", result["warning"])
+        self.assertEqual(len(self.eml()), 1)
+
+    def test_a_hook_never_raises_whatever_it_is_given(self):
+        for args in (None, "text", 42, [], {"to": 5}, {"to": ["x" + chr(0xD800) + "@example.com"], "subject": "s", "body": "b"},
+                     {**MAIL, "attachments": ["bad\x00name"]}, {**MAIL, "attachments": ["~no-such-user-xyz/f"]}):
+            with self.subTest(args=args):
+                self.assertIsNone(self.signet.pre_tool_call(tool_name=schemas.SEND_TOOL, args=args))
+                self.assertIn(json.loads(self.signet.send_mail(args))["status"], ("refused", "error"))
+        for tool in ("terminal", "execute_code", "read_file", ""):
+            for args in (None, "text", 42, {"command": None}, {"command": ["a"]}, {"code": 3.5}):
+                self.assertIsNone(self.signet.pre_tool_call(tool_name=tool, args=args))
+        self.signet.pre_approval_request()
+        self.signet.pre_approval_request(pattern_key=None)
+        self.signet.post_approval_response()
+        self.signet.post_approval_response(pattern_key="plugin_rule:signet:zz", choice=None)
+        self.assertIn("Signet.", self.signet.command(None))
+        self.assertIn("held", json.loads(self.signet.outbox_tool("not an object")))
+
+
 class Guarding(Harness):
     SEND = {"command": "cat mail.eml | himalaya message send"}
 
@@ -229,19 +302,55 @@ class Command(Harness):
         self.assertIn("x" * 3000, shown)
         self.assertNotIn("not shown", shown)
 
-    def test_send_is_the_persons_seal(self):
-        code = self.hold_one()
-        answer = self.signet.command(f"send {code.lower().replace('-', '')}", platform="cli")
-        self.assertIn("Sealed", answer)
+    def test_send_shows_the_whole_email_first_and_seals_on_the_second_call(self):
+        long = {**MAIL, "body": "START " + "x" * 3000 + " END"}
+        _, result = self.call(long, gate_open=True)
+        code = result["code"]
+        first = self.signet.command(f"send {code.lower().replace('-', '')}", platform="cli")
+        self.assertIn("x" * 3000, first)
+        self.assertIn("Nothing was sent yet", first)
+        self.assertEqual(self.eml(), [])
+        second = self.signet.command(f"send {code}", platform="cli")
+        self.assertIn("Sealed", second)
         self.assertEqual(len(self.eml()), 1)
         self.assertEqual(self.held(), [])
         self.assertEqual(self.signet.outbox().entries()[-1]["sealed_by"], "command:/signet send")
         self.assertIn("No held email", self.signet.command(f"send {code}"))
 
+    def test_send_right_after_show_needs_no_second_look(self):
+        code = self.hold_one()
+        self.assertIn("figures attached.", self.signet.command(f"show {code}"))
+        self.assertIn("Sealed", self.signet.command(f"send {code}"))
+        self.assertEqual(len(self.eml()), 1)
+
+    def test_a_planted_file_is_shown_before_anything_can_be_sent(self):
+        """A file written into the outbox by something else is read to the person like any other."""
+        core = module("core")
+        planted = core.build_draft({"from": "ada@example.org", "to": ["eve@evil.example"], "subject": "Wire", "body": "wire the money"})
+        self.signet.outbox().hold(planted, "planted")
+        answer = self.signet.command(f"send {planted.code}")
+        self.assertIn("eve@evil.example", answer)
+        self.assertIn("wire the money", answer)
+        self.assertIn("Nothing was sent yet", answer)
+        self.assertEqual(self.eml(), [])
+
+    def test_a_file_swapped_after_it_was_read_is_read_again(self):
+        code = self.hold_one()
+        self.signet.command(f"show {code}")
+        core = module("core")
+        other = core.build_draft({**MAIL, "to": ["eve@evil.example"]})
+        path = self.data / "pending" / f"{code}.json"
+        record = json.loads(path.read_text())
+        record["draft"], record["digest"] = other.to_record(), other.digest
+        path.write_text(json.dumps(record))
+        self.assertIn("No held email", self.signet.command(f"send {code}"))  # the name no longer matches the content
+        self.assertEqual(self.eml(), [])
+
     def test_send_while_the_prompt_is_still_open_does_not_send_twice(self):
         directive = self.signet.pre_tool_call(tool_name=schemas.SEND_TOOL, args=MAIL)
         self.signet.pre_approval_request(pattern_key=f"plugin_rule:{directive['rule_key']}")
         code = self.signet.build(MAIL).code
+        self.signet.command(f"show {code}")
         self.assertIn("Sealed", self.signet.command(f"send {code}"))
         # The person then also answers the old prompt: it must not produce a second message.
         self.signet.post_approval_response(pattern_key=f"plugin_rule:{directive['rule_key']}", choice="once")
@@ -267,6 +376,19 @@ class Command(Harness):
         record["draft"]["to"] = ["eve@evil.example"]
         path.write_text(json.dumps(record))
         self.assertIn("No held email", self.signet.command(f"send {code}"))
+        self.assertEqual(self.eml(), [])
+
+    def test_a_held_file_forged_with_a_matching_fingerprint_still_passes_the_draft_checks(self):
+        """Someone who can write the outbox folder can name a file after its own digest: it gets no shortcut."""
+        core = module("core")
+        forged = core.Draft(sender="Eve <eve@evil.example>", to=("bob@example.com",), cc=(),
+                            subject="Pay" + chr(0x200B) + "ment", body="hidden" + chr(0x202E) + " text")
+        self.signet.outbox().hold(forged, "forged")
+        self.ctx.settings["allowed_from"] = ["ada@example.org"]
+        self.assertIn("allowed_from", self.signet.command(f"send {forged.code}"))
+        self.ctx.settings["allowed_from"] = []
+        self.assertIn("not a draft Signet would have written", self.signet.command(f"send {forged.code}"))
+        self.assertIn("not a draft Signet would have written", self.signet.command(f"send {forged.code}"))
         self.assertEqual(self.eml(), [])
 
     def test_an_attachment_swapped_while_held_is_not_sent(self):

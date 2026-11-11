@@ -9,11 +9,13 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  unit:
+    name: Unit tests (Python ${{ matrix.python }})
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        python: ["3.11", "3.12", "3.13"]
+        python: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -21,3 +23,42 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Unit tests
         run: python -m unittest discover -s tests -t tests -v
+
+  hermes:
+    name: Real Hermes ${{ matrix.hermes }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        hermes: ["v0.23.0", "v0.23.1"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: signet
+      - name: Check out Hermes ${{ matrix.hermes }}
+        uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ matrix.hermes }}
+          path: hermes-agent
+          # Hermes reads its own version from the release tags.
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v5
+      - name: Install Hermes from its lock file
+        working-directory: hermes-agent
+        run: uv sync --frozen --no-dev
+      - name: Seven scenarios through the real plugin manager and approval gate
+        env:
+          HERMES_AGENT_DIR: ${{ github.workspace }}/hermes-agent
+          HERMES_HOME: ${{ runner.temp }}/hermes-home
+        run: |
+          mkdir -p "$HERMES_HOME"
+          hermes-agent/.venv/bin/python signet/tests/hermes_integration.py | tee integration.txt
+          grep -q "7/7 scenarios passed" integration.txt
+      - name: Catalog validation
+        env:
+          HERMES_AGENT_DIR: ${{ github.workspace }}/hermes-agent
+          HERMES_HOME: ${{ runner.temp }}/hermes-home
+        run: hermes-agent/.venv/bin/python signet/tests/hermes_validate.py signet
